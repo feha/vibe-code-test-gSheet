@@ -7,8 +7,8 @@ contain other instances) with photos, tags, relationships, duplication and searc
 database *you* own — and that store *is* the identity. Three backends:
 
 1. **Local JSON file** — a human-editable document on the server's filesystem. ✅ working
-2. **Postgres** — a connection to your own PostgreSQL instance. 🚧 adapter stubbed
-3. **Google Sheet** — "Excel as a database". 🚧 adapter stubbed
+2. **Postgres** — a connection to your own PostgreSQL instance. ✅ working (live-verified)
+3. **Google Sheet** — "Excel as a database". 🟡 implemented; live path needs OAuth creds
 
 **Multi-user = multiple app instances on the same store with no race conditions.**
 Every mutation goes through `Store::transact` (load → apply → atomic commit → retry on
@@ -62,6 +62,10 @@ encrypt/decrypt roundtrips, cross-process concurrency).
 
 ## Status
 
-Working end-to-end on the **File** backend (verified in a real browser — see
-`docs/e2e-*.png`). **Postgres** and **Google Sheet** adapters are wired into the
-`Store` factory as stubs and are the next milestone.
+Working end-to-end on the **File** and **Postgres** backends — both driven in a real
+browser (`docs/e2e-*.png`), with Postgres additionally proven by a live concurrency
+test (8×10 transacts → no lost updates via `SELECT … FOR UPDATE`). The **Google Sheet**
+adapter is fully implemented (Inventory↔cell mapping + optimistic version-cell
+concurrency, unit-tested via an injected fake transport); its live path just needs a
+Google OAuth token + spreadsheet id to enable the gated integration test
+(`GSHEET_TEST_SPREADSHEET_ID` + `GSHEET_TEST_TOKEN`).
