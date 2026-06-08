@@ -10,7 +10,7 @@ use std::thread;
 
 use inv_core::InventoryExt;
 use inv_model::{Inventory, Photo};
-use inv_store::{FileStore, Store, StoreError};
+use inv_store::{FileStore, Store, StoreError, StoreExt};
 
 use tempfile::tempdir;
 

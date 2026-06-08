@@ -6,14 +6,16 @@ members = [
     "crates/inv-store",
     "crates/inv-crypto",
     "crates/inv-server",
+    "crates/inv-app",
 ]
-# The tested set is the model + core only. inv-crypto and inv-server are
-# obsolete/being replaced and kept out of default-members; the model change may
-# break their compile and that is intentional (they are not in the tested set).
+# The tested set is the model + core + store + the gateway server. inv-crypto is
+# obsolete (zero-knowledge blob-store era) and kept out of default-members; the
+# model change may break its compile and that is intentional.
 default-members = [
     "crates/inv-model",
     "crates/inv-core",
     "crates/inv-store",
+    "crates/inv-server",
 ]
 
 [workspace.package]

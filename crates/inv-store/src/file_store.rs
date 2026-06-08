@@ -146,10 +146,10 @@ impl Store for FileStore {
         }
     }
 
-    fn transact<T>(
+    fn transact_dyn(
         &self,
-        f: &mut dyn FnMut(&mut Inventory) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
+        f: &mut dyn FnMut(&mut Inventory) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
         let mut last_err: Option<StoreError> = None;
         for _ in 0..MAX_ATTEMPTS {
             // Acquire the exclusive lock for the whole read-modify-write. This
@@ -168,9 +168,9 @@ impl Store for FileStore {
             // and commit atomically — all before releasing.
             let result = (|| {
                 let mut inv = self.read_inventory()?;
-                let value = f(&mut inv)?;
+                f(&mut inv)?;
                 self.commit_inventory(&inv)?;
-                Ok(value)
+                Ok(())
             })();
 
             let _ = FileExt::unlock(&lock);

@@ -13,6 +13,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 fs4 = { version = "0.13", features = ["sync"] }
 
+# Backend adapter deps. Declared now so later agents only touch the module files
+# (src/postgres.rs, src/gsheet.rs); the current stubs do not use them.
+postgres = "0.19"
+r2d2 = { version = "0.8", optional = true }
+r2d2_postgres = { version = "0.18", optional = true }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
 [dev-dependencies]
 tempfile = "3"
 proptest = { workspace = true }

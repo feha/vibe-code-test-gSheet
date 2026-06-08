@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 
 use inv_core::InventoryExt;
-use inv_store::{FileStore, Store, StoreError};
+use inv_store::{FileStore, StoreError, StoreExt};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
