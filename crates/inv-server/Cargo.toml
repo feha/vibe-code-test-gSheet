@@ -1,0 +1,28 @@
+[package]
+name = "inv-server"
+edition.workspace = true
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "inv-server"
+path = "src/main.rs"
+
+[dependencies]
+inv-model = { workspace = true }
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+redb = "2"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+bytes = "1"
+tempfile = "3"

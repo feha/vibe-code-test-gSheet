@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/inv-model",
+    "crates/inv-core",
+    "crates/inv-crypto",
+    "crates/inv-server",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+inv-model = { path = "crates/inv-model" }
+inv-core = { path = "crates/inv-core" }
+inv-crypto = { path = "crates/inv-crypto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+proptest = "1"
