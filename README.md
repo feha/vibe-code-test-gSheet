@@ -7,8 +7,8 @@ contain other instances) with photos, tags, relationships, duplication and searc
 database *you* own — and that store *is* the identity. Three backends:
 
 1. **Local JSON file** — a human-editable document on the server's filesystem. ✅ working
-2. **Postgres** — a connection to your own PostgreSQL instance. ✅ working (live-verified)
-3. **Google Sheet** — "Excel as a database". 🟡 implemented; live path needs OAuth creds
+2. **Postgres** — your own PostgreSQL instance, stored in **real relational tables + views**. ✅ working (live-verified)
+3. **Google Sheet** — "Excel as a database", stored as **one tab per class** (rows = items, columns = fields). 🟡 public-link read works with zero setup; OAuth read-write needs a one-time Google OAuth client
 
 **Multi-user = multiple app instances on the same store with no race conditions.**
 Every mutation goes through `Store::transact` (load → apply → atomic commit → retry on
@@ -25,7 +25,8 @@ crates/
   inv-model   data types (i64 ids, name-keyed classes), serde JSON  [pure]
   inv-core    InventoryExt domain logic: add/edit/move/duplicate/search,
               containment (proven acyclic), cascade delete, auto-class inference
-  inv-store   Store trait + race-free transact(); FileStore (JSON) + pg/sheet stubs
+  inv-store   Store trait + race-free transact(); native adapters: FileStore (JSON),
+              PostgresStore (relational tables + views), GSheetStore (one tab per class)
   inv-server  axum gateway: opens a store by descriptor, runs ops via transact,
               serves the WASM SPA. Stateless, store-cache, spawn_blocking.
   inv-app     Leptos CSR WASM UI: "open database" screen + inventory UI
@@ -65,7 +66,10 @@ encrypt/decrypt roundtrips, cross-process concurrency).
 Working end-to-end on the **File** and **Postgres** backends — both driven in a real
 browser (`docs/e2e-*.png`), with Postgres additionally proven by a live concurrency
 test (8×10 transacts → no lost updates via `SELECT … FOR UPDATE`). The **Google Sheet**
-adapter is fully implemented (Inventory↔cell mapping + optimistic version-cell
-concurrency, unit-tested via an injected fake transport); its live path just needs a
-Google OAuth token + spreadsheet id to enable the gated integration test
-(`GSHEET_TEST_SPREADSHEET_ID` + `GSHEET_TEST_TOKEN`).
+adapter maps the inventory onto native tabs (one tab per class, plus `_classes`/
+`_class_fields`/`_relationships`/`_meta`), with optimistic version-cell concurrency —
+the mapping + retry logic are unit-tested via an injected fake transport. Access modes:
+**public-link** reads with zero setup; **OAuth** read-write needs a one-time Google
+OAuth client (server-side), then the gated live test runs with
+`GSHEET_TEST_SPREADSHEET_ID` + `GSHEET_TEST_TOKEN`. (Programmatically creating a Google
+account is impossible — CAPTCHA/SMS/ToS — so the write path needs that one credential.)
