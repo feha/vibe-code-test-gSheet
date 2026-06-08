@@ -1,23 +1,9 @@
-//! Contract tests for the shared data model. Written FIRST (TDD RED).
+//! Contract tests for the shared data model (store-backed, no UUIDs).
 
 use inv_model::{
-    Class, ClassId, FieldDef, FieldType, FieldValue, Instance, InstanceId, Workspace, WorkspaceId,
+    Class, FieldDef, FieldType, FieldValue, Instance, Inventory, Photo, Relationship,
 };
-use std::str::FromStr;
-
-#[test]
-fn workspace_id_roundtrips_through_string() {
-    let id = WorkspaceId::new_random();
-    let s = id.to_string();
-    let parsed = WorkspaceId::from_str(&s).unwrap();
-    assert_eq!(id, parsed);
-}
-
-#[test]
-fn ids_are_unique_per_new_random() {
-    assert_ne!(InstanceId::new_random(), InstanceId::new_random());
-    assert_ne!(ClassId::new_random(), ClassId::new_random());
-}
+use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn field_value_serde_roundtrip_for_every_variant() {
@@ -35,13 +21,21 @@ fn field_value_serde_roundtrip_for_every_variant() {
 }
 
 #[test]
-fn workspace_to_bytes_then_from_bytes_preserves_contents() {
-    let mut ws = Workspace::new(WorkspaceId::new_random());
-    let cid = ClassId::new_random();
-    ws.classes.insert(
-        cid,
+fn next_instance_id_advances_counter() {
+    let mut inv = Inventory::new();
+    let a = inv.next_instance_id();
+    let b = inv.next_instance_id();
+    assert_eq!(a, 1);
+    assert_eq!(b, 2);
+    assert_eq!(inv.next_id, 3);
+}
+
+#[test]
+fn inventory_to_json_then_from_json_preserves_contents() {
+    let mut inv = Inventory::new();
+    inv.classes.insert(
+        "Box".into(),
         Class {
-            id: cid,
             name: "Box".into(),
             fields: vec![FieldDef {
                 name: "color".into(),
@@ -51,24 +45,42 @@ fn workspace_to_bytes_then_from_bytes_preserves_contents() {
             created_at: 1,
         },
     );
-    let iid = InstanceId::new_random();
-    ws.instances.insert(
+    let iid = inv.next_instance_id();
+    let mut fields = BTreeMap::new();
+    fields.insert("color".to_string(), FieldValue::Text("red".to_string()));
+    let mut tags = BTreeSet::new();
+    tags.insert("storage".to_string());
+    inv.instances.insert(
         iid,
         Instance {
             id: iid,
-            class_id: cid,
+            class: "Box".into(),
             name: "Red box".into(),
-            fields: Default::default(),
-            tags: Default::default(),
+            fields,
+            tags,
             parent: None,
-            photos: vec![],
-            relationships: vec![],
+            photos: vec![Photo {
+                key: format!("{iid}-0"),
+                mime: "image/jpeg".into(),
+                name: "box.jpg".into(),
+            }],
+            relationships: vec![Relationship {
+                kind: "contains".into(),
+                target: 99,
+            }],
             created_at: 1,
             updated_at: 1,
         },
     );
 
-    let bytes = ws.to_bytes().unwrap();
-    let back = Workspace::from_bytes(&bytes).unwrap();
-    assert_eq!(ws, back);
+    let bytes = inv.to_json_bytes().unwrap();
+    let back = Inventory::from_json_bytes(&bytes).unwrap();
+    assert_eq!(inv, back);
+}
+
+#[test]
+fn on_disk_format_is_pretty() {
+    let inv = Inventory::new();
+    let text = String::from_utf8(inv.to_json_bytes().unwrap()).unwrap();
+    assert!(text.contains('\n'), "on-disk JSON must be pretty-printed");
 }

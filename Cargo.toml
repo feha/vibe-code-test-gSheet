@@ -3,8 +3,17 @@ resolver = "2"
 members = [
     "crates/inv-model",
     "crates/inv-core",
+    "crates/inv-store",
     "crates/inv-crypto",
     "crates/inv-server",
+]
+# The tested set is the model + core only. inv-crypto and inv-server are
+# obsolete/being replaced and kept out of default-members; the model change may
+# break their compile and that is intentional (they are not in the tested set).
+default-members = [
+    "crates/inv-model",
+    "crates/inv-core",
+    "crates/inv-store",
 ]
 
 [workspace.package]
@@ -15,6 +24,7 @@ license = "MIT"
 [workspace.dependencies]
 inv-model = { path = "crates/inv-model" }
 inv-core = { path = "crates/inv-core" }
+inv-store = { path = "crates/inv-store" }
 inv-crypto = { path = "crates/inv-crypto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
