@@ -119,6 +119,42 @@ pub trait StoreExt: Store {
 
 impl<S: Store + ?Sized> StoreExt for S {}
 
+/// How the Google Sheets backend authenticates and which spreadsheet it targets.
+///
+/// Crucially, **no secrets travel on the wire**. The browser only ever names a
+/// public URL or a spreadsheet id and an *access mode*; any credential
+/// (OAuth client/token, service-account key) is read server-side from the
+/// environment by [`open`]. This keeps tokens out of the client and out of the
+/// gateway's request bodies / store-cache keys.
+///
+/// Serde tag is `"mode"` with `snake_case` variants, so the wire forms are:
+/// `{"mode":"public_url","url":"https://docs.google.com/.../export?format=csv"}`,
+/// `{"mode":"oauth","spreadsheet_id":"abc"}`,
+/// `{"mode":"app_hosted","spreadsheet_id":"abc"}` (or `spreadsheet_id` omitted /
+/// `null` to mean "create a fresh spreadsheet for me").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum GSheetMode {
+    /// A read path over a *published / link-shared* sheet reachable without any
+    /// credential (e.g. a CSV-export URL). No server env required.
+    PublicUrl { url: String },
+    /// Read/write a private sheet authorized by **server-side** OAuth credentials
+    /// (the browser never sends a token). The credential is loaded from the
+    /// environment by [`open`]; only the `spreadsheet_id` is supplied here.
+    ///
+    /// `rename_all = "snake_case"` would map this to `o_auth`; we pin it to
+    /// `oauth` to match the agreed wire contract.
+    #[serde(rename = "oauth")]
+    OAuth { spreadsheet_id: String },
+    /// Read/write using the app's own **server-side** identity (a Google service
+    /// account). `spreadsheet_id = None` asks the backend to create a brand-new
+    /// spreadsheet owned by the app and use that.
+    AppHosted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spreadsheet_id: Option<String>,
+    },
+}
+
 /// A serializable description of *which* backing store to open and how to reach
 /// it. The bring-your-own-database UI sends one of these with every request; the
 /// gateway uses [`open`] to obtain (and cache) a live [`Store`].
@@ -126,7 +162,8 @@ impl<S: Store + ?Sized> StoreExt for S {}
 /// Serde tag is `"kind"` with `snake_case` variants, so the wire forms are:
 /// `{"kind":"file","path":"..."}`,
 /// `{"kind":"postgres","url":"..."}`,
-/// `{"kind":"gsheet","spreadsheet_id":"...","token":"..."}`.
+/// `{"kind":"gsheet","mode":{"mode":"public_url","url":"..."}}` (and the other
+/// [`GSheetMode`] shapes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StoreDescriptor {
@@ -134,16 +171,14 @@ pub enum StoreDescriptor {
     File { path: String },
     /// A [`PostgresStore`] reachable at the connection `url`.
     Postgres { url: String },
-    /// A [`GSheetStore`] over the Google Sheet `spreadsheet_id`, authorized by
-    /// the OAuth access `token`.
+    /// A [`GSheetStore`] over a Google Sheet, reached via one of three access
+    /// [`modes`](GSheetMode). Secrets are never carried here — they are resolved
+    /// server-side from the environment by [`open`].
     ///
     /// `rename_all = "snake_case"` would map this variant to `g_sheet`; we pin it
     /// to `gsheet` to match the agreed wire contract.
     #[serde(rename = "gsheet")]
-    GSheet {
-        spreadsheet_id: String,
-        token: String,
-    },
+    GSheet { mode: GSheetMode },
 }
 
 /// Open the [`Store`] described by `desc`.
@@ -151,14 +186,31 @@ pub enum StoreDescriptor {
 /// `File` yields a working [`FileStore`]. `Postgres` and `GSheet` yield their
 /// (currently stubbed) adapters, which route correctly but return
 /// [`StoreError::Backend`] from their methods until implemented.
+///
+/// For [`GSheetMode::OAuth`] / [`GSheetMode::AppHosted`] the required credential
+/// is read from the **server environment** here (never from the request):
+///
+/// * `INV_GSHEET_OAUTH_CLIENT` — OAuth client config (path to JSON, or inline JSON)
+/// * `INV_GSHEET_TOKEN` — a pre-obtained OAuth access/refresh token
+/// * `INV_GSHEET_SERVICE_ACCOUNT` — service-account key (path to JSON, or inline JSON)
+///
+/// If a mode needs a credential that is not configured, the constructor returns
+/// [`StoreError::Backend`] with an actionable message naming the missing env var.
+/// [`GSheetMode::PublicUrl`] needs no credential.
 pub fn open(desc: &StoreDescriptor) -> Result<Box<dyn Store>, StoreError> {
     match desc {
         StoreDescriptor::File { path } => Ok(Box::new(FileStore::new(path))),
         StoreDescriptor::Postgres { url } => Ok(Box::new(PostgresStore::open(url)?)),
-        StoreDescriptor::GSheet {
-            spreadsheet_id,
-            token,
-        } => Ok(Box::new(GSheetStore::open(spreadsheet_id, token)?)),
+        StoreDescriptor::GSheet { mode } => {
+            let store = match mode {
+                GSheetMode::PublicUrl { url } => GSheetStore::public_url(url)?,
+                GSheetMode::OAuth { spreadsheet_id } => GSheetStore::oauth(spreadsheet_id)?,
+                GSheetMode::AppHosted { spreadsheet_id } => {
+                    GSheetStore::app_hosted(spreadsheet_id.clone())?
+                }
+            };
+            Ok(Box::new(store))
+        }
     }
 }
 
@@ -228,16 +280,63 @@ mod tests {
             }
         );
 
-        let gs: StoreDescriptor = serde_json::from_str(
-            r#"{"kind":"gsheet","spreadsheet_id":"abc","token":"tok"}"#,
+        // Public-URL mode: no secret on the wire, just a URL.
+        let gs_public: StoreDescriptor = serde_json::from_str(
+            r#"{"kind":"gsheet","mode":{"mode":"public_url","url":"https://x/csv"}}"#,
         )
         .unwrap();
         assert_eq!(
-            gs,
+            gs_public,
             StoreDescriptor::GSheet {
-                spreadsheet_id: "abc".to_string(),
-                token: "tok".to_string()
+                mode: GSheetMode::PublicUrl {
+                    url: "https://x/csv".to_string()
+                }
             }
+        );
+
+        // OAuth mode: spreadsheet id only; the token lives server-side.
+        let gs_oauth: StoreDescriptor = serde_json::from_str(
+            r#"{"kind":"gsheet","mode":{"mode":"oauth","spreadsheet_id":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gs_oauth,
+            StoreDescriptor::GSheet {
+                mode: GSheetMode::OAuth {
+                    spreadsheet_id: "abc".to_string()
+                }
+            }
+        );
+
+        // App-hosted with an explicit id.
+        let gs_app: StoreDescriptor = serde_json::from_str(
+            r#"{"kind":"gsheet","mode":{"mode":"app_hosted","spreadsheet_id":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gs_app,
+            StoreDescriptor::GSheet {
+                mode: GSheetMode::AppHosted {
+                    spreadsheet_id: Some("abc".to_string())
+                }
+            }
+        );
+
+        // App-hosted with no id == "create a new sheet for me". The id field may
+        // be omitted entirely, and round-trips back to the omitted form.
+        let gs_app_new: StoreDescriptor =
+            serde_json::from_str(r#"{"kind":"gsheet","mode":{"mode":"app_hosted"}}"#).unwrap();
+        assert_eq!(
+            gs_app_new,
+            StoreDescriptor::GSheet {
+                mode: GSheetMode::AppHosted {
+                    spreadsheet_id: None
+                }
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&gs_app_new).unwrap(),
+            serde_json::json!({"kind":"gsheet","mode":{"mode":"app_hosted"}})
         );
     }
 
@@ -254,15 +353,61 @@ mod tests {
     }
 
     #[test]
-    fn open_gsheet_routes_to_stub() {
+    fn open_gsheet_public_url_routes_to_stub() {
+        // PublicUrl needs no credential, so open() always succeeds and routes to
+        // the (stubbed) adapter, which reports a gsheet backend error on use.
         let store = open(&StoreDescriptor::GSheet {
-            spreadsheet_id: "sid".to_string(),
-            token: "tok".to_string(),
+            mode: GSheetMode::PublicUrl {
+                url: "https://example/csv".to_string(),
+            },
         })
         .expect("factory routes even though adapter is a stub");
         match store.load() {
             Err(StoreError::Backend(m)) => assert!(m.contains("gsheet")),
             other => panic!("expected Backend(gsheet...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_gsheet_oauth_without_credential_is_actionable_error() {
+        // With no server-side OAuth credential configured, opening an OAuth-mode
+        // sheet fails fast with a clear, actionable message naming the env var.
+        // (Guard against a credential leaking in from the ambient environment.)
+        if std::env::var_os("INV_GSHEET_TOKEN").is_some()
+            || std::env::var_os("INV_GSHEET_OAUTH_CLIENT").is_some()
+        {
+            return;
+        }
+        let res = open(&StoreDescriptor::GSheet {
+            mode: GSheetMode::OAuth {
+                spreadsheet_id: "sid".to_string(),
+            },
+        });
+        match res {
+            Err(StoreError::Backend(m)) => {
+                assert!(m.contains("INV_GSHEET"), "message names the env var: {m}");
+            }
+            Err(other) => panic!("expected Backend(... INV_GSHEET ...), got {other:?}"),
+            Ok(_) => panic!("expected an error when no OAuth credential is configured"),
+        }
+    }
+
+    #[test]
+    fn open_gsheet_app_hosted_without_credential_is_actionable_error() {
+        if std::env::var_os("INV_GSHEET_SERVICE_ACCOUNT").is_some() {
+            return;
+        }
+        let res = open(&StoreDescriptor::GSheet {
+            mode: GSheetMode::AppHosted {
+                spreadsheet_id: None,
+            },
+        });
+        match res {
+            Err(StoreError::Backend(m)) => {
+                assert!(m.contains("INV_GSHEET"), "message names the env var: {m}");
+            }
+            Err(other) => panic!("expected Backend(... INV_GSHEET ...), got {other:?}"),
+            Ok(_) => panic!("expected an error when no service account is configured"),
         }
     }
 }

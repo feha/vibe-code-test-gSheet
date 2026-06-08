@@ -19,6 +19,9 @@ postgres = "0.19"
 r2d2 = { version = "0.8", optional = true }
 r2d2_postgres = { version = "0.18", optional = true }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+# CSV parsing for reading published / link-shared ("public URL") Google Sheets,
+# which export as CSV. Declared now so the next agent only edits src/gsheet.rs.
+csv = "1"
 
 [dev-dependencies]
 tempfile = "3"

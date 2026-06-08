@@ -5,7 +5,7 @@
 use leptos::prelude::*;
 use web_sys::HtmlInputElement;
 
-use crate::api::StoreDescriptor;
+use crate::api::{GSheetMode, StoreDescriptor};
 use crate::components::{AddForm, DetailPanel, Navigator, SearchBar};
 use crate::state::{AppState, ToastKind};
 
@@ -75,19 +75,53 @@ fn OpenDatabase() -> impl IntoView {
         state.open(StoreDescriptor::Postgres { url });
     };
 
-    // Google Sheet
-    let gs_id = RwSignal::new(String::new());
-    let gs_token = RwSignal::new(String::new());
-    let open_gs = move |_| {
-        let spreadsheet_id = gs_id.get();
-        let token = gs_token.get();
-        if spreadsheet_id.trim().is_empty() || token.trim().is_empty() {
-            state.error("Enter a spreadsheet id and token");
+    // Google Sheet — public link (read-only)
+    let gs_public_url = RwSignal::new(String::new());
+    let open_gs_public = move |_| {
+        let url = gs_public_url.get();
+        if url.trim().is_empty() {
+            state.error("Enter a published sheet URL");
             return;
         }
         state.open(StoreDescriptor::GSheet {
-            spreadsheet_id,
-            token,
+            mode: GSheetMode::PublicUrl { url },
+        });
+    };
+
+    // Google Sheet — OAuth (server-side credential)
+    let gs_oauth_id = RwSignal::new(String::new());
+    let open_gs_oauth = move |_| {
+        let spreadsheet_id = gs_oauth_id.get();
+        if spreadsheet_id.trim().is_empty() {
+            state.error("Enter a spreadsheet id or URL");
+            return;
+        }
+        state.open(StoreDescriptor::GSheet {
+            mode: GSheetMode::OAuth { spreadsheet_id },
+        });
+    };
+
+    // Google Sheet — app-hosted (server-side service account)
+    let gs_app_id = RwSignal::new(String::new());
+    // "Create a sheet for me": no id -> the backend creates a fresh spreadsheet.
+    let open_gs_app_new = move |_| {
+        state.open(StoreDescriptor::GSheet {
+            mode: GSheetMode::AppHosted {
+                spreadsheet_id: None,
+            },
+        });
+    };
+    // Open an existing app-hosted sheet by id.
+    let open_gs_app_existing = move |_| {
+        let id = gs_app_id.get();
+        if id.trim().is_empty() {
+            state.error("Enter a spreadsheet id or URL");
+            return;
+        }
+        state.open(StoreDescriptor::GSheet {
+            mode: GSheetMode::AppHosted {
+                spreadsheet_id: Some(id),
+            },
         });
     };
 
@@ -127,22 +161,48 @@ fn OpenDatabase() -> impl IntoView {
 
                 <div class="card open-option">
                     <h2 class="card-title">"Google Sheet"</h2>
-                    <p class="muted">"Use a Google Sheet as the backing store."</p>
-                    <input
-                        class="text-input"
-                        r#type="text"
-                        placeholder="spreadsheet id"
-                        prop:value=move || gs_id.get()
-                        on:input=move |ev| gs_id.set(event_value(&ev))
-                    />
-                    <input
-                        class="text-input"
-                        r#type="text"
-                        placeholder="OAuth access token"
-                        prop:value=move || gs_token.get()
-                        on:input=move |ev| gs_token.set(event_value(&ev))
-                    />
-                    <button class="btn btn-primary" on:click=open_gs>"Open"</button>
+                    <p class="muted">"Use a Google Sheet as the backing store. Pick how to connect."</p>
+
+                    <div class="gs-mode">
+                        <h3 class="gs-mode-title">"Public link (read-only)"</h3>
+                        <p class="muted">"Read a published or link-shared sheet. No sign-in. Changes cannot be saved."</p>
+                        <input
+                            class="text-input"
+                            r#type="text"
+                            placeholder="https://docs.google.com/.../export?format=csv"
+                            prop:value=move || gs_public_url.get()
+                            on:input=move |ev| gs_public_url.set(event_value(&ev))
+                        />
+                        <button class="btn btn-primary" on:click=open_gs_public>"Open read-only"</button>
+                    </div>
+
+                    <div class="gs-mode">
+                        <h3 class="gs-mode-title">"Connect with Google (OAuth)"</h3>
+                        <p class="muted">"Read and write a private sheet. Requires the server to be configured with a Google OAuth credential."</p>
+                        <input
+                            class="text-input"
+                            r#type="text"
+                            placeholder="spreadsheet id or URL"
+                            prop:value=move || gs_oauth_id.get()
+                            on:input=move |ev| gs_oauth_id.set(event_value(&ev))
+                        />
+                        <button class="btn btn-primary" on:click=open_gs_oauth>"Connect"</button>
+                    </div>
+
+                    <div class="gs-mode">
+                        <h3 class="gs-mode-title">"Create a sheet for me"</h3>
+                        <p class="muted">"The app creates and owns a fresh sheet. Requires a server-side service account."</p>
+                        <button class="btn btn-primary" on:click=open_gs_app_new>"Create a new sheet"</button>
+                        <p class="muted">"…or open an existing app-hosted sheet:"</p>
+                        <input
+                            class="text-input"
+                            r#type="text"
+                            placeholder="spreadsheet id or URL (optional)"
+                            prop:value=move || gs_app_id.get()
+                            on:input=move |ev| gs_app_id.set(event_value(&ev))
+                        />
+                        <button class="btn btn-secondary" on:click=open_gs_app_existing>"Open existing"</button>
+                    </div>
                 </div>
             </div>
         </main>

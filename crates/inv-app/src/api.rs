@@ -12,6 +12,29 @@ use gloo_net::http::Request;
 use inv_model::{FieldValue, Inventory};
 use serde::{Deserialize, Serialize};
 
+/// Mirror of `inv_store::GSheetMode`.
+///
+/// serde tag `"mode"`, snake_case variants, with `OAuth` pinned to `"oauth"`
+/// (snake_case would otherwise yield `o_auth`). No secrets travel on the wire:
+/// the browser only names a public URL or a spreadsheet id plus an access mode;
+/// any credential is resolved server-side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum GSheetMode {
+    /// Read a published / link-shared sheet (e.g. a CSV-export URL). No credential.
+    PublicUrl { url: String },
+    /// Read/write a private sheet authorized by a server-side OAuth credential;
+    /// only the `spreadsheet_id` is supplied here.
+    #[serde(rename = "oauth")]
+    OAuth { spreadsheet_id: String },
+    /// Read/write using the app's own server-side identity (a service account).
+    /// `spreadsheet_id = None` asks the backend to create a fresh spreadsheet.
+    AppHosted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spreadsheet_id: Option<String>,
+    },
+}
+
 /// Mirror of `inv_store::StoreDescriptor`.
 ///
 /// serde tag `"kind"`, snake_case variants, with `GSheet` pinned to `"gsheet"`
@@ -27,8 +50,7 @@ pub enum StoreDescriptor {
     },
     #[serde(rename = "gsheet")]
     GSheet {
-        spreadsheet_id: String,
-        token: String,
+        mode: GSheetMode,
     },
 }
 
@@ -38,9 +60,18 @@ impl StoreDescriptor {
         match self {
             StoreDescriptor::File { path } => format!("File: {path}"),
             StoreDescriptor::Postgres { url } => format!("Postgres: {url}"),
-            StoreDescriptor::GSheet { spreadsheet_id, .. } => {
-                format!("Google Sheet: {spreadsheet_id}")
-            }
+            StoreDescriptor::GSheet { mode } => match mode {
+                GSheetMode::PublicUrl { url } => format!("Google Sheet (public): {url}"),
+                GSheetMode::OAuth { spreadsheet_id } => {
+                    format!("Google Sheet (OAuth): {spreadsheet_id}")
+                }
+                GSheetMode::AppHosted {
+                    spreadsheet_id: Some(id),
+                } => format!("Google Sheet (app): {id}"),
+                GSheetMode::AppHosted {
+                    spreadsheet_id: None,
+                } => "Google Sheet (app: new)".to_string(),
+            },
         }
     }
 }
