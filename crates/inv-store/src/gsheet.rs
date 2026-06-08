@@ -65,7 +65,7 @@
 //!
 //! The grid mapping, CSV parsing, URL/id parsing, and the optimistic-retry
 //! decision are all pure / fake-transport-driven so they are unit-tested without a
-//! network. The live network path uses [`ReqwestTransport`] and is **UNVERIFIED**
+//! network. The live network path uses [`UreqTransport`] and is **UNVERIFIED**
 //! in this environment (no Google credentials); its end-to-end test is
 //! `#[ignore]` and self-skips when creds are absent.
 
@@ -625,7 +625,9 @@ fn parse_csv(text: &str) -> Grid {
 
 /// Extract the spreadsheet id from a Google Sheets URL.
 ///
-/// Accepts the common shapes:
+/// Accepts the common shapes, including the standard share/edit URL a user
+/// copies straight out of the browser address bar:
+/// * `https://docs.google.com/spreadsheets/d/<ID>/edit?usp=sharing`
 /// * `https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0`
 /// * `https://docs.google.com/spreadsheets/d/<ID>/export?format=csv`
 /// * `https://docs.google.com/spreadsheets/d/e/<PUBLISHED_ID>/pub?output=csv`
@@ -633,17 +635,23 @@ fn parse_csv(text: &str) -> Grid {
 /// Falls back to a `?id=<ID>` / `&id=<ID>` query parameter. Returns
 /// [`StoreError::Backend`] when no id can be found.
 fn parse_spreadsheet_id(url: &str) -> Result<String, StoreError> {
+    // A path segment ends at the next `/`, `?` or `#`.
+    let segment = |s: &str| -> String {
+        s.chars()
+            .take_while(|&c| c != '/' && c != '?' && c != '#')
+            .collect()
+    };
     // Path form: .../d/<id>/...  (the published form .../d/e/<id> is also valid;
     // we take whatever segment follows /d/, which for /d/e/<id> would be "e" —
     // so special-case the published shape first.)
     if let Some(after) = url.split("/d/e/").nth(1) {
-        let id: String = after.chars().take_while(|&c| c != '/' && c != '?').collect();
+        let id = segment(after);
         if !id.is_empty() {
             return Ok(id);
         }
     }
     if let Some(after) = url.split("/d/").nth(1) {
-        let id: String = after.chars().take_while(|&c| c != '/' && c != '?').collect();
+        let id = segment(after);
         if !id.is_empty() {
             return Ok(id);
         }
@@ -817,7 +825,7 @@ fn parse_created_id(body: &Value) -> Result<String, StoreError> {
 // ===========================================================================
 
 /// The minimal HTTP surface the store needs. Implemented for real by
-/// [`ReqwestTransport`]; implemented by a fake in tests so the grid mapping and
+/// [`UreqTransport`]; implemented by a fake in tests so the grid mapping and
 /// optimistic retry loop run without a network.
 trait Transport: Send + Sync {
     /// `GET url`, returning the raw response text (used for the public CSV path).
@@ -831,73 +839,64 @@ trait Transport: Send + Sync {
     fn post_json(&self, url: &str, token: &str, body: &Value) -> Result<Value, StoreError>;
 }
 
-/// The live [`Transport`] over `reqwest::blocking`.
-struct ReqwestTransport {
-    client: reqwest::blocking::Client,
-}
+/// The live [`Transport`] over [`ureq`].
+///
+/// `ureq` performs **pure blocking I/O with no internal async runtime**, so —
+/// unlike `reqwest::blocking`, whose embedded tokio runtime panics when dropped
+/// inside the gateway's `spawn_blocking` context — it is safe to call from
+/// within tokio's blocking pool. This is the entire reason the backend uses
+/// `ureq` instead of `reqwest`.
+struct UreqTransport;
 
-impl ReqwestTransport {
+impl UreqTransport {
     fn new() -> Result<Self, StoreError> {
-        let client = reqwest::blocking::Client::builder()
-            .build()
-            .map_err(|e| StoreError::Backend(format!("gsheet: build http client: {e}")))?;
-        Ok(ReqwestTransport { client })
+        Ok(UreqTransport)
     }
 }
 
-impl Transport for ReqwestTransport {
-    fn get_text(&self, url: &str) -> Result<String, StoreError> {
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| StoreError::Backend(format!("gsheet: GET {url}: {e}")))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .map_err(|e| StoreError::Backend(format!("gsheet: read GET {url}: {e}")))?;
-        if !status.is_success() {
-            return Err(StoreError::Backend(format!(
-                "gsheet: GET {url} -> {status}: {text}"
-            )));
+/// Translate a `ureq` error into a clear [`StoreError::Backend`].
+///
+/// `ureq` models an HTTP 4xx/5xx as `Error::Status(code, response)` and a
+/// connect/transport failure (refused connection, DNS, TLS, timeout) as
+/// `Error::Transport(_)`. Both become a `Backend` error with the status/body or
+/// the transport message, so callers see a normal error and the worker never
+/// panics.
+fn ureq_error(verb: &str, url: &str, err: ureq::Error) -> StoreError {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            StoreError::Backend(format!("gsheet: {verb} {url} -> {code}: {body}"))
         }
-        Ok(text)
+        ureq::Error::Transport(t) => {
+            StoreError::Backend(format!("gsheet: {verb} {url}: {t}"))
+        }
+    }
+}
+
+impl Transport for UreqTransport {
+    fn get_text(&self, url: &str) -> Result<String, StoreError> {
+        let resp = ureq::get(url)
+            .call()
+            .map_err(|e| ureq_error("GET", url, e))?;
+        resp.into_string()
+            .map_err(|e| StoreError::Backend(format!("gsheet: read GET {url}: {e}")))
     }
 
     fn get_json(&self, url: &str, token: &str) -> Result<Value, StoreError> {
-        let resp = self
-            .client
-            .get(url)
-            .header(reqwest::header::AUTHORIZATION, auth_header(token))
-            .send()
-            .map_err(|e| StoreError::Backend(format!("gsheet: GET {url}: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
-            return Err(StoreError::Backend(format!(
-                "gsheet: GET {url} -> {status}: {text}"
-            )));
-        }
-        resp.json::<Value>()
+        let resp = ureq::get(url)
+            .set("Authorization", &auth_header(token))
+            .call()
+            .map_err(|e| ureq_error("GET", url, e))?;
+        resp.into_json::<Value>()
             .map_err(|e| StoreError::Backend(format!("gsheet: decode GET {url}: {e}")))
     }
 
     fn post_json(&self, url: &str, token: &str, body: &Value) -> Result<Value, StoreError> {
-        let resp = self
-            .client
-            .post(url)
-            .header(reqwest::header::AUTHORIZATION, auth_header(token))
-            .json(body)
-            .send()
-            .map_err(|e| StoreError::Backend(format!("gsheet: POST {url}: {e}")))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().unwrap_or_default();
-            return Err(StoreError::Backend(format!(
-                "gsheet: POST {url} -> {status}: {text}"
-            )));
-        }
-        resp.json::<Value>()
+        let resp = ureq::post(url)
+            .set("Authorization", &auth_header(token))
+            .send_json(body.clone())
+            .map_err(|e| ureq_error("POST", url, e))?;
+        resp.into_json::<Value>()
             .map_err(|e| StoreError::Backend(format!("gsheet: decode POST {url}: {e}")))
     }
 }
@@ -960,7 +959,7 @@ impl GSheetStore {
             access: Access::PublicUrl {
                 url: url.to_string(),
             },
-            transport: Box::new(ReqwestTransport::new()?),
+            transport: Box::new(UreqTransport::new()?),
         })
     }
 
@@ -987,7 +986,7 @@ impl GSheetStore {
                 spreadsheet_id: spreadsheet_id.to_string(),
                 token,
             },
-            transport: Box::new(ReqwestTransport::new()?),
+            transport: Box::new(UreqTransport::new()?),
         })
     }
 
@@ -1011,7 +1010,7 @@ impl GSheetStore {
                 spreadsheet_id: std::sync::Mutex::new(spreadsheet_id),
                 service_account,
             },
-            transport: Box::new(ReqwestTransport::new()?),
+            transport: Box::new(UreqTransport::new()?),
         })
     }
 
@@ -1059,8 +1058,34 @@ impl GSheetStore {
             TAB_PHOTOS,
             TAB_META,
         ] {
-            let csv = self.transport.get_text(&gviz_csv_url(id, special))?;
-            grids.insert(special.to_string(), parse_csv(&csv));
+            // gviz answers a missing tab with an error document, not a 404, so a
+            // brand-new blank sheet (which has only the default "Sheet1" and none
+            // of our native tabs) reads back garbage rather than erroring per-tab.
+            // We tolerate that here and diagnose the missing structure once, below,
+            // with an actionable message instead of a cryptic CSV/parse error.
+            match self.transport.get_text(&gviz_csv_url(id, special)) {
+                Ok(csv) => {
+                    grids.insert(special.to_string(), parse_csv(&csv));
+                }
+                Err(_) => {
+                    grids.insert(special.to_string(), Grid::new());
+                }
+            }
+        }
+        // A correctly-initialized native sheet always carries the `_meta`
+        // `version` row. If it is absent, this sheet was never written by us
+        // (e.g. a fresh blank sheet shared as a public link). Public links are
+        // read-only, so we cannot initialize it here — tell the user how.
+        if read_meta_value(&grids, "version")
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Err(StoreError::Backend(
+                "this Google Sheet has no inventory data yet; public links are \
+                 read-only — use the OAuth mode to initialize and write to a sheet"
+                    .to_string(),
+            ));
         }
         // Each class named in `_classes` gets its own tab read.
         let class_names: Vec<String> = grids
@@ -1507,6 +1532,14 @@ mod tests {
                 .unwrap(),
             "ABC123"
         );
+        // The standard share/edit URL copied straight from the browser.
+        assert_eq!(
+            parse_spreadsheet_id(
+                "https://docs.google.com/spreadsheets/d/ABC123/edit?usp=sharing"
+            )
+            .unwrap(),
+            "ABC123"
+        );
         assert_eq!(
             parse_spreadsheet_id(
                 "https://docs.google.com/spreadsheets/d/ABC123/export?format=csv"
@@ -1885,6 +1918,49 @@ mod tests {
                 assert!(m.contains("gsheet") && m.contains("spreadsheet id"), "{m}")
             }
             other => panic!("expected Backend(parse) error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn public_blank_sheet_gives_actionable_error() {
+        // A brand-new blank public sheet has none of our native tabs, so gviz
+        // returns no usable `_meta` `version`. Rather than a cryptic parse error,
+        // the load surfaces an actionable message pointing at OAuth mode.
+
+        /// A fake transport whose every gviz CSV read returns an empty document,
+        /// modeling a blank sheet that lacks our native tabs.
+        struct BlankPublic;
+        impl Transport for BlankPublic {
+            fn get_text(&self, _url: &str) -> Result<String, StoreError> {
+                Ok(String::new())
+            }
+            fn get_json(&self, _url: &str, _token: &str) -> Result<Value, StoreError> {
+                unreachable!("public path never calls get_json")
+            }
+            fn post_json(
+                &self,
+                _url: &str,
+                _token: &str,
+                _body: &Value,
+            ) -> Result<Value, StoreError> {
+                unreachable!("public path never calls post_json")
+            }
+        }
+
+        let store = GSheetStore::with_transport(
+            Access::PublicUrl {
+                url: "https://docs.google.com/spreadsheets/d/BLANK/edit?usp=sharing".into(),
+            },
+            Box::new(BlankPublic),
+        );
+        match store.load() {
+            Err(StoreError::Backend(m)) => {
+                assert!(
+                    m.contains("no inventory data yet") && m.contains("OAuth"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected an actionable Backend error, got {other:?}"),
         }
     }
 

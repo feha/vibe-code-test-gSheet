@@ -18,7 +18,12 @@ fs4 = { version = "0.13", features = ["sync"] }
 postgres = "0.19"
 r2d2 = { version = "0.8", optional = true }
 r2d2_postgres = { version = "0.18", optional = true }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Runtime-free blocking HTTP client for the Google Sheets transport. Unlike
+# `reqwest::blocking` (which spins up its own internal tokio runtime and panics
+# when that runtime is dropped inside the gateway's `spawn_blocking` context),
+# `ureq` does pure blocking I/O with no internal async runtime, so it is safe to
+# call from within tokio's blocking pool.
+ureq = { version = "2", features = ["json"] }
 # CSV parsing for reading published / link-shared ("public URL") Google Sheets,
 # which export as CSV. Declared now so the next agent only edits src/gsheet.rs.
 csv = "1"
