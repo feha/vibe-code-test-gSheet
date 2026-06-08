@@ -4,3 +4,13 @@
 dist/
 node_modules/
 .DS_Store
+
+# Secrets / keys — never commit
+github-deploy-key
+github-deploy-key.pub
+*.pem
+*.key
+id_rsa
+id_ed25519
+.env
+.env.*
