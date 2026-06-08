@@ -24,6 +24,8 @@ pub enum CoreError {
     WouldCycle,
     /// The requested parent is not a valid container (e.g. does not exist).
     InvalidParent(i64),
+    /// A class cannot be deleted while one or more instances still reference it.
+    ClassInUse,
 }
 
 impl fmt::Display for CoreError {
@@ -32,6 +34,7 @@ impl fmt::Display for CoreError {
             CoreError::NotFound(id) => write!(f, "instance not found: {id}"),
             CoreError::WouldCycle => write!(f, "operation would create a cycle"),
             CoreError::InvalidParent(id) => write!(f, "invalid parent: {id}"),
+            CoreError::ClassInUse => write!(f, "class is in use by one or more instances"),
         }
     }
 }
@@ -126,6 +129,8 @@ pub trait InventoryExt {
     fn attach_photo(&mut self, id: i64, photo: Photo, now: i64) -> Result<(), CoreError>;
     fn detach_photo(&mut self, id: i64, key: &str, now: i64) -> Result<(), CoreError>;
     fn duplicate_instance(&mut self, id: i64, deep: bool, now: i64) -> Result<i64, CoreError>;
+    fn change_class(&mut self, id: i64, new_class: &str, now: i64) -> Result<(), CoreError>;
+    fn delete_class(&mut self, name: &str) -> Result<(), CoreError>;
     fn search(&self, q: &SearchQuery) -> Vec<i64>;
 }
 
@@ -447,6 +452,31 @@ impl InventoryExt for Inventory {
             self.instances.insert(inst.id, inst);
         }
         Ok(id_map[&id])
+    }
+
+    fn change_class(&mut self, id: i64, new_class: &str, now: i64) -> Result<(), CoreError> {
+        if !self.instances.contains_key(&id) {
+            return Err(CoreError::NotFound(id));
+        }
+        self.ensure_class(new_class, now);
+        // Auto-extend the target class with the instance's current fields,
+        // inferring each FieldType from its value (same rule add_instance uses).
+        let fields = self.instances[&id].fields.clone();
+        extend_class_schema(self, new_class, &fields);
+
+        let inst = self.instances.get_mut(&id).expect("checked above");
+        inst.class = new_class.to_string();
+        inst.updated_at = now;
+        Ok(())
+    }
+
+    fn delete_class(&mut self, name: &str) -> Result<(), CoreError> {
+        if self.instances.values().any(|i| i.class == name) {
+            return Err(CoreError::ClassInUse);
+        }
+        // Idempotent: removing an absent class is a no-op success.
+        self.classes.remove(name);
+        Ok(())
     }
 
     fn search(&self, q: &SearchQuery) -> Vec<i64> {
@@ -973,6 +1003,103 @@ mod tests {
             ..Default::default()
         };
         assert!(w.search(&q).is_empty());
+    }
+
+    #[test]
+    fn change_class_moves_instance_and_extends_target() {
+        let mut w = inv();
+        let mut fields = BTreeMap::new();
+        fields.insert("color".to_string(), FieldValue::Text("red".to_string()));
+        fields.insert("qty".to_string(), FieldValue::Number(2.0));
+        let id = w.add_instance("Old", "thing", fields, None, 1).unwrap();
+        assert_eq!(w.get(id).unwrap().class, "Old");
+
+        // Target class "New" does not exist yet -> change_class auto-creates it.
+        assert!(!w.class_exists("New"));
+        w.change_class(id, "New", 42).unwrap();
+
+        let inst = w.get(id).unwrap();
+        assert_eq!(inst.class, "New");
+        assert_eq!(inst.updated_at, 42);
+        // fields remain on the instance
+        assert_eq!(
+            inst.fields.get("color"),
+            Some(&FieldValue::Text("red".to_string()))
+        );
+
+        // The new class was created and extended with the instance's fields,
+        // with FieldType inferred from each value, exactly once each.
+        let class = w.get_class("New").unwrap();
+        assert_eq!(class.created_at, 42);
+        assert_eq!(class.fields.len(), 2);
+        let color = class.fields.iter().find(|f| f.name == "color").unwrap();
+        assert_eq!(color.field_type, FieldType::Text);
+        let qty = class.fields.iter().find(|f| f.name == "qty").unwrap();
+        assert_eq!(qty.field_type, FieldType::Number);
+    }
+
+    #[test]
+    fn change_class_missing_instance_errs() {
+        let mut w = inv();
+        let bogus = 999;
+        let err = w.change_class(bogus, "New", 1).unwrap_err();
+        assert_eq!(err, CoreError::NotFound(bogus));
+    }
+
+    #[test]
+    fn delete_class_in_use_errs_with_no_mutation() {
+        let mut w = inv();
+        let id = w.add_instance("Box", "a", BTreeMap::new(), None, 1).unwrap();
+        assert!(w.class_exists("Box"));
+        let before = w.clone();
+
+        let err = w.delete_class("Box").unwrap_err();
+        assert_eq!(err, CoreError::ClassInUse);
+        // no mutation: the class and instance are untouched
+        assert!(w.class_exists("Box"));
+        assert!(w.get(id).is_some());
+        assert_eq!(w, before);
+    }
+
+    #[test]
+    fn delete_class_succeeds_once_unused_and_is_idempotent() {
+        let mut w = inv();
+        let id = w.add_instance("Box", "a", BTreeMap::new(), None, 1).unwrap();
+        // Still in use -> error.
+        assert_eq!(w.delete_class("Box").unwrap_err(), CoreError::ClassInUse);
+
+        // Remove the only instance referencing it.
+        w.remove_instance(id, RemoveMode::Cascade).unwrap();
+        assert!(w.class_exists("Box"));
+
+        // Now deletion succeeds.
+        w.delete_class("Box").unwrap();
+        assert!(!w.class_exists("Box"));
+
+        // Idempotent: deleting an absent class is a no-op success.
+        w.delete_class("Box").unwrap();
+        assert!(!w.class_exists("Box"));
+        // Deleting a never-existed class is also a no-op success.
+        w.delete_class("NeverExisted").unwrap();
+    }
+
+    #[test]
+    fn change_class_then_delete_old_class() {
+        let mut w = inv();
+        let id = w.add_instance("Old", "a", BTreeMap::new(), None, 1).unwrap();
+        // Old class is in use, cannot delete yet.
+        assert_eq!(w.delete_class("Old").unwrap_err(), CoreError::ClassInUse);
+
+        // Move the instance to a different class.
+        w.change_class(id, "New", 5).unwrap();
+        assert_eq!(w.get(id).unwrap().class, "New");
+
+        // Now nothing references "Old" -> it can be deleted.
+        assert!(w.class_exists("Old"));
+        w.delete_class("Old").unwrap();
+        assert!(!w.class_exists("Old"));
+        // "New" still present and in use.
+        assert!(w.class_exists("New"));
     }
 }
 

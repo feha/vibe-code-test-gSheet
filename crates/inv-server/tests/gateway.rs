@@ -195,6 +195,88 @@ async fn op_on_missing_instance_is_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn change_class_op_updates_instance_class() {
+    let app = api_router(AppState::new());
+    let (desc, _dir) = file_descriptor();
+
+    // Add an instance of class "Old" (gets id 1).
+    let add = json!({
+        "store": desc,
+        "op": {"op":"add_instance","class":"Old","name":"a","fields":{"color":{"kind":"text","value":"red"}},"parent":null,"tags":[]}
+    });
+    let resp = app.clone().oneshot(post_json("/api/op", &add)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Change its class to "New".
+    let chg = json!({
+        "store": desc,
+        "op": {"op":"change_class","id":1,"new_class":"New"}
+    });
+    let resp = app.oneshot(post_json("/api/op", &chg)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let inv = body_json(resp).await;
+    assert_eq!(inv["instances"]["1"]["class"], "New");
+    // The new class exists and was extended with the instance's field.
+    assert_eq!(inv["classes"]["New"]["name"], "New");
+    let new_fields = inv["classes"]["New"]["fields"].as_array().unwrap();
+    assert!(new_fields.iter().any(|f| f["name"] == "color"));
+}
+
+#[tokio::test]
+async fn delete_class_in_use_is_409() {
+    let app = api_router(AppState::new());
+    let (desc, _dir) = file_descriptor();
+
+    let add = json!({
+        "store": desc,
+        "op": {"op":"add_instance","class":"Box","name":"a","fields":{},"parent":null,"tags":[]}
+    });
+    let resp = app.clone().oneshot(post_json("/api/op", &add)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let del = json!({
+        "store": desc,
+        "op": {"op":"delete_class","name":"Box"}
+    });
+    let resp = app.oneshot(post_json("/api/op", &del)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn delete_class_unused_is_200_and_gone() {
+    let app = api_router(AppState::new());
+    let (desc, _dir) = file_descriptor();
+
+    // Create class "Ghost" by adding then removing an instance of it.
+    let add = json!({
+        "store": desc,
+        "op": {"op":"add_instance","class":"Ghost","name":"a","fields":{},"parent":null,"tags":[]}
+    });
+    let resp = app.clone().oneshot(post_json("/api/op", &add)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rm = json!({
+        "store": desc,
+        "op": {"op":"remove_instance","id":1,"mode":"cascade"}
+    });
+    let resp = app.clone().oneshot(post_json("/api/op", &rm)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let inv = body_json(resp).await;
+    // Class still present before deletion.
+    assert!(inv["classes"].as_object().unwrap().contains_key("Ghost"));
+
+    // Now delete the unused class.
+    let del = json!({
+        "store": desc,
+        "op": {"op":"delete_class","name":"Ghost"}
+    });
+    let resp = app.oneshot(post_json("/api/op", &del)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let inv = body_json(resp).await;
+    assert!(!inv["classes"].as_object().unwrap().contains_key("Ghost"));
+}
+
 /// Minimal percent-encoder for query values used in tests (encodes the chars we
 /// care about: `/`, `:`, space, `{`, `}`, `"`, `,`).
 fn urlencoding(s: &str) -> String {

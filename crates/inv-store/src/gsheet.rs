@@ -55,11 +55,12 @@
 //! * **`PublicUrl`** — READ-**WRITE** over a link-shared ("anyone with link can
 //!   edit") sheet with NO credential. Reads use the unauthenticated gviz CSV
 //!   export; writes replicate the Sheets web-editor's anonymous `/edit` + `/save`
-//!   protocol (cookies only). To keep the write opcode surface to just the
-//!   captured "set one cell to a string" command, this mode uses a **single-sheet
-//!   flat layout** on `Sheet1` (see the "Single-sheet flat layout" section) rather
-//!   than the multi-tab native layout. The flat layout round-trips losslessly
-//!   through both gviz CSV and the `/save` writer.
+//!   protocol (cookies only). The inventory is spread across **three separate
+//!   tabs** — `Meta`, `Classes`, `Instances` (see the "Multi-tab layout
+//!   (anonymous mode)" section) — so the classes table and instances table live in
+//!   their own tabs, not one flat `Sheet1`. The `/save` writer creates any missing
+//!   tab (add-sheet command) and writes header + data rows; structured columns use
+//!   the model's own serde JSON, round-tripping losslessly through gviz CSV.
 //! * **`OAuth`** — read/write via Sheets API v4 with an OAuth access token read
 //!   from `INV_GSHEET_TOKEN` (or an OAuth client from `INV_GSHEET_OAUTH_CLIENT`).
 //!   Uses the multi-tab native layout above.
@@ -609,14 +610,54 @@ const OP_BUNDLE: i64 = 21299578;
 /// MAGIC, build-version-tied (see [`OP_BUNDLE`]); re-capture on editor updates.
 const OP_SET_CELL: i64 = 132274236;
 
-/// The single tab we read/write in anonymous mode. A link-shared sheet starts
-/// with exactly one tab named `Sheet1`; the anonymous `/save` opcode only
-/// addresses cells of an existing grid, so we keep everything on this one tab.
-const ANON_SHEET_NAME: &str = "Sheet1";
+/// Outer "add sheet" compound command tag. Wraps two inner commands: the
+/// add-sheet body ([`OP_ADD_SHEET_BODY`]) and the index positioner
+/// ([`OP_ADD_SHEET_INDEX`]).
+///
+/// MAGIC, build-version-tied (see [`OP_BUNDLE`]); re-capture on editor updates.
+/// Verified live (probe: revision advanced, gviz showed the new tab).
+const OP_ADD_SHEET: i64 = 4444216;
 
-/// The grid id of the first tab. The set-cell command addresses a grid by this
-/// string id; the default first sheet is always `"0"`.
-const ANON_GID: &str = "0";
+/// Inner add-sheet body tag: creates a tab with a client-chosen gid + name and
+/// default 1000x26 dimensions.
+///
+/// MAGIC, build-version-tied (see [`OP_BUNDLE`]); re-capture on editor updates.
+const OP_ADD_SHEET_BODY: i64 = 21350203;
+
+/// Inner add-sheet index tag: positions the new tab at a given 0-based index.
+///
+/// MAGIC, build-version-tied (see [`OP_BUNDLE`]); re-capture on editor updates.
+const OP_ADD_SHEET_INDEX: i64 = 28950036;
+
+// The anonymous PublicUrl layout no longer stores data on the default first tab
+// (`Sheet1`, gid `"0"`), but we never delete it: Sheets requires at least one tab
+// and the captured opcode surface has no delete-sheet command.
+//
+// --- The three fixed tabs of the anonymous (PublicUrl) multi-tab layout. -----
+//
+// Each tab has a FIXED, client-chosen gid constant so the add-sheet command and
+// the subsequent set-cell commands agree on the grid id within one /save bundle.
+// The constants are large and arbitrary to avoid colliding with auto-assigned
+// gids (Sheet1 is gid 0; the editor assigns large random gids to user tabs).
+
+/// Tab name + gid for the key/value `Meta` tab (next_id, version).
+const ANON_TAB_META: &str = "Meta";
+const ANON_GID_META: &str = "990001";
+
+/// Tab name + gid for the `Classes` tab (one row per class).
+const ANON_TAB_CLASSES: &str = "Classes";
+const ANON_GID_CLASSES: &str = "990002";
+
+/// Tab name + gid for the `Instances` tab (one row per instance).
+const ANON_TAB_INSTANCES: &str = "Instances";
+const ANON_GID_INSTANCES: &str = "990003";
+
+/// The three (name, gid) tab definitions, in the index order they are created.
+const ANON_TABS: [(&str, &str); 3] = [
+    (ANON_TAB_META, ANON_GID_META),
+    (ANON_TAB_CLASSES, ANON_GID_CLASSES),
+    (ANON_TAB_INSTANCES, ANON_GID_INSTANCES),
+];
 
 /// Parse the current revision from the `/edit` HTML (`"revision":<N>`).
 fn parse_html_revision(html: &str) -> Option<i64> {
@@ -624,6 +665,45 @@ fn parse_html_revision(html: &str) -> Option<i64> {
     let i = html.find(needle)? + needle.len();
     let digits: String = html[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// Parse the set of existing tab names from the `/edit` HTML.
+///
+/// The editor renders each tab caption as
+/// `<div class="...docs-sheet-tab-caption">NAME</div>`. We scan for that marker
+/// and collect the text up to the next `<`. This is the source of truth for "does
+/// tab X already exist" in the anonymous multi-tab write path: gviz cannot answer
+/// it (a missing tab silently falls back to the first sheet rather than erroring
+/// on this kind of link-shared sheet), but the rendered caption list always names
+/// every tab.
+///
+/// Brittleness: this parses presentation HTML, so an editor markup change to the
+/// caption class would break detection. The failure mode is safe-ish — a tab seen
+/// as "missing" would get a duplicate add-sheet (which the server rejects, failing
+/// the save loudly) rather than silent corruption.
+fn parse_html_tab_names(html: &str) -> BTreeSet<String> {
+    let marker = "docs-sheet-tab-caption\">";
+    let mut names = BTreeSet::new();
+    let mut rest = html;
+    while let Some(i) = rest.find(marker) {
+        let after = &rest[i + marker.len()..];
+        let name: String = after.chars().take_while(|&c| c != '<').collect();
+        if !name.is_empty() {
+            names.insert(decode_html_entities(&name));
+        }
+        rest = after;
+    }
+    names
+}
+
+/// Decode the handful of HTML entities the editor uses in tab captions, so a tab
+/// named e.g. `A&B` matches the model's plain string.
+fn decode_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// Parse the server-assigned session id from the `/edit` HTML (`"sid":"<hex>"`).
@@ -657,13 +737,69 @@ fn anon_inner_set_cell(gid: &str, row: i64, col: i64, v: &str) -> String {
     .to_string()
 }
 
-/// Build the `bundles` POST field: a JSON array carrying one command per cell.
-/// `[{"commands":[[OP_BUNDLE,"<inner>"], ...],"sid":"<sid>","reqId":<id>}]`.
-fn anon_build_bundles(sid: &str, req_id: i64, cells: &[(i64, i64, String)]) -> String {
-    let commands: Vec<Value> = cells
-        .iter()
-        .map(|(r, c, v)| serde_json::json!([OP_BUNDLE, anon_inner_set_cell(ANON_GID, *r, *c, v)]))
-        .collect();
+/// Build the INNER add-sheet body command string for a new tab with grid id
+/// `gid` and `name`, sized to the default 1000 rows x 26 columns.
+///
+/// Captured-verbatim shape (build-tied):
+/// `[1,0,"<gid>",[[[0,0,"<name>"],[2,0,null,null,0],[3,0,null,null,null,0],
+///   [4,0,null,null,null,null,0],[5,0,null,null,null,null,null,0],
+///   [6,0,null,null,null,null,null,null,0]]],1000,26]`.
+fn anon_inner_add_sheet(gid: &str, name: &str) -> String {
+    let n = Value::Null;
+    serde_json::json!([
+        1, 0, gid,
+        [[
+            [0, 0, name],
+            [2, 0, n, n, 0],
+            [3, 0, n, n, n, 0],
+            [4, 0, n, n, n, n, 0],
+            [5, 0, n, n, n, n, n, 0],
+            [6, 0, n, n, n, n, n, n, 0]
+        ]],
+        1000, 26
+    ])
+    .to_string()
+}
+
+/// Build the INNER add-sheet index command string positioning a new tab at the
+/// 0-based `index`. Captured-verbatim shape: `[[[[4,0,null,null,<index>]]]]`.
+fn anon_inner_add_index(index: i64) -> String {
+    let n = Value::Null;
+    serde_json::json!([[[[4, 0, n, n, index]]]]).to_string()
+}
+
+/// A single mutation to include in a `/save` bundle.
+enum AnonCmd {
+    /// Create a tab `name` with grid id `gid`, positioned at 0-based `index`.
+    AddSheet { gid: String, name: String, index: i64 },
+    /// Set cell `(row, col)` of grid `gid` to the string `value`.
+    SetCell { gid: String, row: i64, col: i64, value: String },
+}
+
+/// Encode one [`AnonCmd`] into its outer `bundles` command value.
+fn anon_command_value(cmd: &AnonCmd) -> Value {
+    match cmd {
+        AnonCmd::AddSheet { gid, name, index } => serde_json::json!([
+            OP_ADD_SHEET,
+            [
+                [OP_ADD_SHEET_BODY, anon_inner_add_sheet(gid, name)],
+                [OP_ADD_SHEET_INDEX, anon_inner_add_index(*index)]
+            ]
+        ]),
+        AnonCmd::SetCell {
+            gid,
+            row,
+            col,
+            value,
+        } => serde_json::json!([OP_BUNDLE, anon_inner_set_cell(gid, *row, *col, value)]),
+    }
+}
+
+/// Build the `bundles` POST field from a heterogeneous command list (add-sheet
+/// and/or set-cell commands), all in one bundle.
+/// `[{"commands":[<cmd>, ...],"sid":"<sid>","reqId":<id>}]`.
+fn anon_build_bundles(sid: &str, req_id: i64, cmds: &[AnonCmd]) -> String {
+    let commands: Vec<Value> = cmds.iter().map(anon_command_value).collect();
     serde_json::json!([{ "commands": commands, "sid": sid, "reqId": req_id }]).to_string()
 }
 
@@ -729,74 +865,83 @@ fn parse_save_response(text: &str) -> Result<i64, StoreError> {
 }
 
 // ---------------------------------------------------------------------------
-// Single-sheet flat layout (anonymous mode).
+// Multi-tab layout (anonymous mode).
 //
-// The whole Inventory lives on ONE tab (`Sheet1`) as a flat list of records, so
-// the gviz CSV read and the cell-by-cell `/save` write agree on the same shape
-// (a lossless round-trip). Column A is a record-type tag; the remaining columns
-// are positional per record type. Everything is a string; structured parts
-// (field defs / field values / relationships / photos) are JSON-encoded so they
-// never collide with the column delimiter and never get number-coerced by gviz.
+// The Inventory is split across THREE separate tabs (each its own grid the user
+// can read in the Sheets UI), instead of one flat `Sheet1`:
 //
-//   A=META  | B=next_id | C=version
-//   A=CLASS | B=name    | C=created_at | D=fields_json
-//   A=INST  | B=id | C=class | D=name | E=parent | F=tags_json
-//           | G=fields_json | H=rels_json | I=photos_json
-//           | J=created_at | K=updated_at
+//   * "Meta"      — header [key, value]; rows: next_id, version.
+//   * "Classes"   — header [name, created_at, fields_json]; one row per class.
+//   * "Instances" — header [id, class, name, parent, tags_json, fields_json,
+//                   relationships_json, photos_json, created_at, updated_at];
+//                   one row per instance.
 //
-// `fields_json` on CLASS is `[{ "name","field_type","required" }, ...]`.
-// `fields_json` on INST is `{ "<name>": <FieldValue-as-serde>, ... }`.
-// `tags_json`   is a JSON array of strings.
-// `rels_json`   is `[{ "kind","target" }, ...]`; `photos_json` is
-//               `[{ "key","mime","name" }, ...]`. All use the model's own serde.
+// Each tab has a header row so a human reads native columns. Structured parts
+// (field defs / field values / tags / relationships / photos) are stored as the
+// model's own serde JSON in a single cell, so they round-trip losslessly and
+// never collide with the CSV delimiter or get number-coerced by gviz. The gviz
+// CSV read and the cell-by-cell `/save` write agree on the same per-tab shapes.
 // ---------------------------------------------------------------------------
 
-/// Record-type tags occupying column A.
-const REC_META: &str = "META";
-const REC_CLASS: &str = "CLASS";
-const REC_INST: &str = "INST";
+/// Header row of the `Meta` tab.
+fn anon_meta_header() -> Vec<String> {
+    vec!["key".into(), "value".into()]
+}
 
-/// Fixed width of the flat grid (the widest record, INST, has 11 columns). Every
-/// emitted row is padded to this width so the write blanks stale trailing cells.
-const FLAT_WIDTH: usize = 11;
+/// Header row of the `Classes` tab.
+fn anon_classes_header() -> Vec<String> {
+    vec!["name".into(), "created_at".into(), "fields_json".into()]
+}
 
-/// Serialize the whole [`Inventory`] into the single flat grid (no header row).
-/// Inverse of [`flat_grid_to_inventory`].
-fn inventory_to_flat_grid(inv: &Inventory) -> Grid {
-    let mut grid: Grid = Vec::new();
+/// Header row of the `Instances` tab.
+fn anon_instances_header() -> Vec<String> {
+    vec![
+        "id".into(),
+        "class".into(),
+        "name".into(),
+        "parent".into(),
+        "tags_json".into(),
+        "fields_json".into(),
+        "relationships_json".into(),
+        "photos_json".into(),
+        "created_at".into(),
+        "updated_at".into(),
+    ]
+}
 
-    let mut push = |cells: Vec<String>| {
-        let mut row = cells;
-        row.resize(FLAT_WIDTH, String::new());
-        grid.push(row);
-    };
+/// Serialize the [`Inventory`] into the three anonymous tabs `{name -> Grid}`,
+/// each with a header row. Inverse of [`anon_grids_to_inventory`].
+fn inventory_to_anon_grids(inv: &Inventory) -> BTreeMap<String, Grid> {
+    let mut grids: BTreeMap<String, Grid> = BTreeMap::new();
 
-    // META (always first).
-    push(vec![
-        REC_META.into(),
-        inv.next_id.to_string(),
-        SCHEMA_VERSION.to_string(),
-    ]);
+    // Meta.
+    let meta: Grid = vec![
+        anon_meta_header(),
+        vec!["next_id".into(), inv.next_id.to_string()],
+        vec!["version".into(), SCHEMA_VERSION.to_string()],
+    ];
+    grids.insert(ANON_TAB_META.to_string(), meta);
 
-    // One CLASS row per class (ordered by name via BTreeMap).
+    // Classes (ordered by name via BTreeMap).
+    let mut classes: Grid = vec![anon_classes_header()];
     for class in inv.classes.values() {
         let fields_json = serde_json::to_string(&class.fields).unwrap_or_else(|_| "[]".into());
-        push(vec![
-            REC_CLASS.into(),
+        classes.push(vec![
             class.name.clone(),
             class.created_at.to_string(),
             fields_json,
         ]);
     }
+    grids.insert(ANON_TAB_CLASSES.to_string(), classes);
 
-    // One INST row per instance (ordered by id via BTreeMap).
+    // Instances (ordered by id via BTreeMap).
+    let mut instances: Grid = vec![anon_instances_header()];
     for inst in inv.instances.values() {
         let tags_json = serde_json::to_string(&inst.tags).unwrap_or_else(|_| "[]".into());
         let fields_json = serde_json::to_string(&inst.fields).unwrap_or_else(|_| "{}".into());
         let rels_json = serde_json::to_string(&inst.relationships).unwrap_or_else(|_| "[]".into());
         let photos_json = serde_json::to_string(&inst.photos).unwrap_or_else(|_| "[]".into());
-        push(vec![
-            REC_INST.into(),
+        instances.push(vec![
             inst.id.to_string(),
             inst.class.clone(),
             inst.name.clone(),
@@ -809,79 +954,94 @@ fn inventory_to_flat_grid(inv: &Inventory) -> Grid {
             inst.updated_at.to_string(),
         ]);
     }
+    grids.insert(ANON_TAB_INSTANCES.to_string(), instances);
 
-    grid
+    grids
 }
 
-/// Fetch column `i` of a row as `&str`, tolerating short rows (gviz trims
-/// trailing empties).
-fn col(row: &[String], i: usize) -> &str {
-    row.get(i).map(String::as_str).unwrap_or("")
-}
-
-/// Reconstruct an [`Inventory`] from the single flat grid. Inverse of
-/// [`inventory_to_flat_grid`]. Unknown/blank rows are skipped; a missing META row
-/// defaults `next_id` to 1 (so a never-written sheet reads as empty).
-fn flat_grid_to_inventory(grid: &Grid) -> Result<Inventory, StoreError> {
+/// Reconstruct an [`Inventory`] from the three anonymous tab grids. Inverse of
+/// [`inventory_to_anon_grids`]. Missing/blank tabs default to empty so a
+/// never-written sheet reconstructs [`Inventory::new`].
+fn anon_grids_to_inventory(grids: &BTreeMap<String, Grid>) -> Result<Inventory, StoreError> {
     let mut inv = Inventory::new();
 
-    for row in grid {
-        match col(row, 0) {
-            REC_META => {
-                let next = col(row, 1).trim();
+    // Meta: next_id (version is read separately for the optimistic loop).
+    if let Some(grid) = grids.get(ANON_TAB_META) {
+        let idx = header_index(grid);
+        for row in grid.iter().skip(1) {
+            if cell(row, &idx, "key") == "next_id" {
+                let next = cell(row, &idx, "value").trim();
                 if !next.is_empty() {
                     inv.next_id = next.parse::<i64>().map_err(|e| {
                         StoreError::Backend(format!("gsheet: bad next_id {next:?}: {e}"))
                     })?;
                 }
             }
-            REC_CLASS => {
-                let name = col(row, 1).to_string();
-                if name.is_empty() {
-                    continue;
-                }
-                let created_at = parse_id(col(row, 2), "class created_at")?;
-                let fields: Vec<FieldDef> = parse_json_cell(col(row, 3), "class fields")?;
-                inv.classes.insert(
-                    name.clone(),
-                    Class {
-                        name,
-                        fields,
-                        created_at,
-                    },
-                );
+        }
+    }
+
+    // Classes.
+    if let Some(grid) = grids.get(ANON_TAB_CLASSES) {
+        let idx = header_index(grid);
+        for row in grid.iter().skip(1) {
+            let name = cell(row, &idx, "name").to_string();
+            if name.is_empty() {
+                continue;
             }
-            REC_INST => {
-                let id = parse_id(col(row, 1), "instance")?;
-                let class = col(row, 2).to_string();
-                let name = col(row, 3).to_string();
-                let parent = decode_opt_id(col(row, 4))?;
-                let tags: BTreeSet<String> = parse_json_cell(col(row, 5), "instance tags")?;
-                let fields: BTreeMap<String, FieldValue> =
-                    parse_json_cell(col(row, 6), "instance fields")?;
-                let relationships: Vec<Relationship> =
-                    parse_json_cell(col(row, 7), "instance relationships")?;
-                let photos: Vec<Photo> = parse_json_cell(col(row, 8), "instance photos")?;
-                let created_at = parse_id(col(row, 9), "instance created_at")?;
-                let updated_at = parse_id(col(row, 10), "instance updated_at")?;
-                inv.instances.insert(
+            let created_at = parse_id(cell(row, &idx, "created_at"), "class created_at")?;
+            let fields: Vec<FieldDef> = parse_json_cell(cell(row, &idx, "fields_json"), "class fields")?;
+            inv.classes.insert(
+                name.clone(),
+                Class {
+                    name,
+                    fields,
+                    created_at,
+                },
+            );
+        }
+    }
+
+    // Instances.
+    if let Some(grid) = grids.get(ANON_TAB_INSTANCES) {
+        let idx = header_index(grid);
+        for row in grid.iter().skip(1) {
+            // Skip wholly blank rows that gviz/Sheets sometimes leaves behind.
+            if row.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            let id_cell = cell(row, &idx, "id");
+            if id_cell.trim().is_empty() {
+                continue;
+            }
+            let id = parse_id(id_cell, "instance")?;
+            let class = cell(row, &idx, "class").to_string();
+            let name = cell(row, &idx, "name").to_string();
+            let parent = decode_opt_id(cell(row, &idx, "parent"))?;
+            let tags: BTreeSet<String> =
+                parse_json_cell(cell(row, &idx, "tags_json"), "instance tags")?;
+            let fields: BTreeMap<String, FieldValue> =
+                parse_json_cell(cell(row, &idx, "fields_json"), "instance fields")?;
+            let relationships: Vec<Relationship> =
+                parse_json_cell(cell(row, &idx, "relationships_json"), "instance relationships")?;
+            let photos: Vec<Photo> =
+                parse_json_cell(cell(row, &idx, "photos_json"), "instance photos")?;
+            let created_at = parse_id(cell(row, &idx, "created_at"), "instance created_at")?;
+            let updated_at = parse_id(cell(row, &idx, "updated_at"), "instance updated_at")?;
+            inv.instances.insert(
+                id,
+                Instance {
                     id,
-                    Instance {
-                        id,
-                        class,
-                        name,
-                        fields,
-                        tags,
-                        parent,
-                        photos,
-                        relationships,
-                        created_at,
-                        updated_at,
-                    },
-                );
-            }
-            // Blank or unknown rows (e.g. gviz padding) are ignored.
-            _ => {}
+                    class,
+                    name,
+                    fields,
+                    tags,
+                    parent,
+                    photos,
+                    relationships,
+                    created_at,
+                    updated_at,
+                },
+            );
         }
     }
 
@@ -1325,7 +1485,7 @@ enum Access {
     ///
     /// Reads use the unauthenticated gviz CSV export; writes use the anonymous
     /// `/edit` + `/save` editor protocol (see the "Anonymous read-WRITE protocol"
-    /// section). Both speak the SINGLE-sheet flat layout on `Sheet1`.
+    /// section). Both speak the multi-tab layout (`Meta`/`Classes`/`Instances`).
     PublicUrl { url: String },
     /// Read/write a private sheet with a server-side OAuth access `token`.
     OAuth {
@@ -1368,8 +1528,8 @@ impl GSheetStore {
     ///
     /// The spreadsheet id is parsed from the URL. Reads use the unauthenticated
     /// gviz CSV export; writes replicate the Sheets web-editor's anonymous
-    /// `/edit` + `/save` protocol (cookies only). Both use the single-sheet flat
-    /// layout on `Sheet1`.
+    /// `/edit` + `/save` protocol (cookies only). Both use the multi-tab layout
+    /// (`Meta`/`Classes`/`Instances`).
     pub fn public_url(url: &str) -> Result<Self, StoreError> {
         Ok(GSheetStore {
             access: Access::PublicUrl {
@@ -1440,15 +1600,15 @@ impl GSheetStore {
     /// known class). For a never-written sheet only the specials exist; class tabs
     /// are discovered from `_classes`.
     ///
-    /// Only the OAuth / AppHosted (Sheets API v4) paths use the multi-tab grid
-    /// layout. The PublicUrl path uses the single-sheet flat layout via
-    /// [`read_public_inventory`] / [`write_public_inventory`] instead, and never
-    /// reaches here.
+    /// Only the OAuth / AppHosted (Sheets API v4) paths use this NATIVE multi-tab
+    /// grid layout (per-class tabs + `_classes`/`_class_fields`/...). The PublicUrl
+    /// path uses its own three-tab anonymous layout via [`read_public_inventory`] /
+    /// [`write_public_inventory`] instead, and never reaches here.
     fn read_all_grids(&self) -> Result<BTreeMap<String, Grid>, StoreError> {
         match &self.access {
             Access::PublicUrl { .. } => unreachable!(
-                "PublicUrl uses the flat-layout read path (read_public_inventory), \
-                 not the multi-tab grid path"
+                "PublicUrl uses the anonymous multi-tab read path \
+                 (read_public_inventory), not the native API grid path"
             ),
             Access::OAuth {
                 spreadsheet_id,
@@ -1468,28 +1628,41 @@ impl GSheetStore {
         }
     }
 
-    // --- Anonymous (PublicUrl) flat-layout read/write -----------------------
+    // --- Anonymous (PublicUrl) multi-tab read/write -------------------------
 
-    /// Read the `Sheet1` flat grid of a link-shared sheet via gviz CSV and
-    /// reconstruct the [`Inventory`]. A never-written (blank) sheet reads back as
-    /// an empty inventory.
+    /// Read the three anonymous tabs (`Meta`, `Classes`, `Instances`) of a
+    /// link-shared sheet via gviz CSV and reconstruct the [`Inventory`]. A
+    /// never-written (blank) sheet reads back as an empty inventory.
+    ///
+    /// Each tab is fetched by name. On this kind of anonymous link-shared sheet a
+    /// gviz request for a missing tab silently returns the first sheet rather than
+    /// an error; that is harmless here because (a) `Instances`/`Classes` rows are
+    /// validated by header column (a stray `Sheet1` doc has no `id`/`name` header,
+    /// so its rows are skipped) and (b) `Meta` only consumes a `next_id` row that a
+    /// foreign sheet will not carry. So a partially-created sheet still reads
+    /// cleanly; the first write creates whatever tabs are missing.
     fn read_public_inventory(&self, id: &str) -> Result<Inventory, StoreError> {
-        let csv = self
-            .transport
-            .get_text(&gviz_csv_url(id, ANON_SHEET_NAME))?;
-        let grid = parse_csv(&csv);
-        flat_grid_to_inventory(&grid)
+        let mut grids: BTreeMap<String, Grid> = BTreeMap::new();
+        for (tab, _gid) in ANON_TABS {
+            let csv = self.transport.get_text(&gviz_csv_url(id, tab))?;
+            grids.insert(tab.to_string(), parse_csv(&csv));
+        }
+        anon_grids_to_inventory(&grids)
     }
 
-    /// Write the full [`Inventory`] back to `Sheet1` of a link-shared sheet using
-    /// the anonymous `/edit` + `/save` editor protocol (no credential).
+    /// Write the full [`Inventory`] back to the `Meta`/`Classes`/`Instances` tabs
+    /// of a link-shared sheet using the anonymous `/edit` + `/save` editor
+    /// protocol (no credential).
     ///
     /// Steps: GET `/edit` (jars cookies, parses the server `sid` + current
-    /// `revision`), then POST `/save` with one set-cell command per non-empty cell
-    /// of the new flat grid, plus blank commands for any cell that the previous
-    /// grid occupied beyond the new content (so the sheet shrinks correctly).
+    /// `revision`, and the list of existing tab names); then POST one `/save`
+    /// bundle. The bundle first emits an add-sheet command for any of the three
+    /// tabs that don't exist yet, then emits set-cell commands writing each tab's
+    /// header + data rows, blanking any trailing cells a previously-larger tab
+    /// left behind. Add-sheet commands precede set-cells so a freshly-created
+    /// tab's cells land in the same bundle (verified live).
     fn write_public_inventory(&self, id: &str, inv: &Inventory) -> Result<(), StoreError> {
-        // 1. GET /edit -> cookies + sid + revision.
+        // 1. GET /edit -> cookies + sid + revision + existing tab names.
         let html = self.transport.get_browser(&anon_edit_url(id))?;
         let rev = parse_html_revision(&html).ok_or_else(|| {
             StoreError::Backend(
@@ -1504,33 +1677,63 @@ impl GSheetStore {
                     .to_string(),
             )
         })?;
+        let existing = parse_html_tab_names(&html);
 
-        // 2. Compute the cell commands. We address every cell of the new grid
-        //    (writing "" for empties), plus blank any cell rows the OLD grid had
-        //    beyond the new row count, so trailing stale rows disappear.
-        let new_grid = inventory_to_flat_grid(inv);
-        let old_csv = self
-            .transport
-            .get_text(&gviz_csv_url(id, ANON_SHEET_NAME))
-            .unwrap_or_default();
-        let old_grid = parse_csv(&old_csv);
+        // 2. Build the command list: add-sheet for missing tabs FIRST, then
+        //    set-cell for every cell across all three tabs.
+        let new_grids = inventory_to_anon_grids(inv);
+        let mut cmds: Vec<AnonCmd> = Vec::new();
 
-        let mut cells: Vec<(i64, i64, String)> = Vec::new();
-        for (r, row) in new_grid.iter().enumerate() {
-            for (c, val) in row.iter().enumerate() {
-                cells.push((r as i64, c as i64, val.clone()));
+        // Add-sheet commands for any missing tab, positioned after Sheet1.
+        for (i, (tab, gid)) in ANON_TABS.iter().enumerate() {
+            if !existing.contains(*tab) {
+                cmds.push(AnonCmd::AddSheet {
+                    gid: gid.to_string(),
+                    name: tab.to_string(),
+                    index: (i + 1) as i64,
+                });
             }
         }
-        // Blank out trailing rows that existed before but not now.
-        for (r, old_row) in old_grid.iter().enumerate().skip(new_grid.len()) {
-            let old_cols = old_row.len().max(FLAT_WIDTH);
-            for c in 0..old_cols {
-                cells.push((r as i64, c as i64, String::new()));
+
+        // Set-cell commands per tab. For each tab, write every cell of the new
+        // grid, then blank any trailing rows the OLD tab had beyond the new
+        // content (read per-tab via gviz, only for tabs that already existed).
+        for (tab, gid) in ANON_TABS {
+            let new_grid = new_grids.get(tab).cloned().unwrap_or_default();
+            let new_cols = new_grid.iter().map(Vec::len).max().unwrap_or(0);
+            let old_grid = if existing.contains(tab) {
+                let csv = self.transport.get_text(&gviz_csv_url(id, tab)).unwrap_or_default();
+                parse_csv(&csv)
+            } else {
+                Vec::new()
+            };
+
+            for (r, row) in new_grid.iter().enumerate() {
+                for (c, val) in row.iter().enumerate() {
+                    cmds.push(AnonCmd::SetCell {
+                        gid: gid.to_string(),
+                        row: r as i64,
+                        col: c as i64,
+                        value: val.clone(),
+                    });
+                }
+            }
+            // Blank stale trailing rows that existed before but not now.
+            for (r, old_row) in old_grid.iter().enumerate().skip(new_grid.len()) {
+                let old_cols = old_row.len().max(new_cols);
+                for c in 0..old_cols {
+                    cmds.push(AnonCmd::SetCell {
+                        gid: gid.to_string(),
+                        row: r as i64,
+                        col: c as i64,
+                        value: String::new(),
+                    });
+                }
             }
         }
 
         // 3. POST /save.
-        let bundles = anon_build_bundles(&sid, 0, &cells);
+        let bundles = anon_build_bundles(&sid, 0, &cmds);
         let (ct, body) = anon_multipart(&[("rev", &rev.to_string()), ("bundles", &bundles)]);
         let resp = self
             .transport
@@ -1600,10 +1803,10 @@ impl GSheetStore {
         set_meta_version(&mut grids, new_version);
 
         match &self.access {
-            // PublicUrl writes go through write_public_inventory (flat layout),
-            // never the multi-tab grid path.
+            // PublicUrl writes go through write_public_inventory (anonymous
+            // multi-tab layout), never this native API grid path.
             Access::PublicUrl { .. } => unreachable!(
-                "PublicUrl uses the flat-layout write path (write_public_inventory)"
+                "PublicUrl uses the anonymous multi-tab write path (write_public_inventory)"
             ),
             Access::OAuth {
                 spreadsheet_id,
@@ -1670,7 +1873,8 @@ fn set_meta_version(grids: &mut BTreeMap<String, Grid>, version: u64) {
 
 impl Store for GSheetStore {
     fn load(&self) -> Result<Inventory, StoreError> {
-        // PublicUrl uses the single-sheet flat layout (gviz read of `Sheet1`).
+        // PublicUrl uses the anonymous multi-tab layout (gviz read of the
+        // Meta/Classes/Instances tabs).
         if let Access::PublicUrl { url } = &self.access {
             let id = parse_spreadsheet_id(url)?;
             return self.read_public_inventory(&id);
@@ -1683,7 +1887,8 @@ impl Store for GSheetStore {
         &self,
         f: &mut dyn FnMut(&mut Inventory) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        // PublicUrl: anonymous (no-OAuth) read-modify-write over the flat layout.
+        // PublicUrl: anonymous (no-OAuth) read-modify-write over the multi-tab
+        // (Meta/Classes/Instances) layout.
         //
         // Sheets has no CAS, so this is the same optimistic loop as the API path,
         // keyed on the on-sheet `next_id`-bearing inventory state rather than a
@@ -1843,37 +2048,76 @@ mod tests {
     // --- anonymous protocol: pure encoding / parsing -----------------------
 
     #[test]
-    fn anon_flat_grid_roundtrip_lossless() {
-        // The single-sheet flat layout round-trips an arbitrary inventory.
+    fn anon_multi_tab_roundtrip_lossless() {
+        // The multi-tab (Meta/Classes/Instances) layout round-trips an arbitrary
+        // inventory.
         let inv = rich_inventory();
-        let grid = inventory_to_flat_grid(&inv);
-        let back = flat_grid_to_inventory(&grid).unwrap();
-        assert_eq!(inv, back, "flat layout: to ∘ from == identity");
+        let grids = inventory_to_anon_grids(&inv);
+        let back = anon_grids_to_inventory(&grids).unwrap();
+        assert_eq!(inv, back, "multi-tab layout: to ∘ from == identity");
     }
 
     #[test]
-    fn anon_flat_empty_inventory_roundtrip() {
+    fn anon_multi_tab_has_three_named_tabs() {
+        let inv = rich_inventory();
+        let grids = inventory_to_anon_grids(&inv);
+        // Exactly the three fixed tabs, each with its header row.
+        let names: BTreeSet<&str> = grids.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [ANON_TAB_META, ANON_TAB_CLASSES, ANON_TAB_INSTANCES]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(grids[ANON_TAB_META][0], anon_meta_header());
+        assert_eq!(grids[ANON_TAB_CLASSES][0], anon_classes_header());
+        assert_eq!(grids[ANON_TAB_INSTANCES][0], anon_instances_header());
+        // Classes/Instances each carry the right number of data rows.
+        assert_eq!(grids[ANON_TAB_CLASSES].len() - 1, inv.classes.len());
+        assert_eq!(grids[ANON_TAB_INSTANCES].len() - 1, inv.instances.len());
+    }
+
+    #[test]
+    fn anon_multi_tab_empty_inventory_roundtrip() {
         let inv = Inventory::new();
-        let grid = inventory_to_flat_grid(&inv);
-        // Exactly one row (META), padded to FLAT_WIDTH.
-        assert_eq!(grid.len(), 1);
-        assert_eq!(grid[0][0], REC_META);
-        assert_eq!(grid[0].len(), FLAT_WIDTH);
-        let back = flat_grid_to_inventory(&grid).unwrap();
+        let grids = inventory_to_anon_grids(&inv);
+        // Each tab is header-only (no data rows) except Meta's key/value rows.
+        assert_eq!(grids[ANON_TAB_CLASSES].len(), 1, "Classes header only");
+        assert_eq!(grids[ANON_TAB_INSTANCES].len(), 1, "Instances header only");
+        let back = anon_grids_to_inventory(&grids).unwrap();
         assert_eq!(inv, back);
         assert_eq!(back.next_id, 1);
     }
 
     #[test]
-    fn anon_flat_grid_through_gviz_csv_roundtrip() {
-        // Prove the read path (gviz CSV) and write path (flat grid) agree: encode
-        // -> CSV -> parse_csv -> flat_grid_to_inventory reconstructs losslessly.
+    fn anon_multi_tab_through_gviz_csv_roundtrip() {
+        // Prove the read path (gviz CSV) and write path (grids) agree per tab:
+        // encode -> CSV -> parse_csv -> reconstruct losslessly.
         let inv = rich_inventory();
-        let grid = inventory_to_flat_grid(&inv);
-        let csv = flat_grid_to_gviz_csv(&grid);
-        let parsed = parse_csv(&csv);
-        let back = flat_grid_to_inventory(&parsed).unwrap();
-        assert_eq!(inv, back, "flat layout survives a gviz CSV round-trip");
+        let grids = inventory_to_anon_grids(&inv);
+        let mut csv_grids: BTreeMap<String, Grid> = BTreeMap::new();
+        for (tab, grid) in &grids {
+            let csv = flat_grid_to_gviz_csv(grid);
+            csv_grids.insert(tab.clone(), parse_csv(&csv));
+        }
+        let back = anon_grids_to_inventory(&csv_grids).unwrap();
+        assert_eq!(inv, back, "multi-tab layout survives a gviz CSV round-trip");
+    }
+
+    #[test]
+    fn anon_missing_tabs_read_as_empty() {
+        // A sheet where Classes/Instances tabs do not yet exist (gviz silently
+        // serves an unrelated doc) must not corrupt the read: foreign rows lacking
+        // the expected headers are skipped, yielding an empty inventory.
+        let mut grids: BTreeMap<String, Grid> = BTreeMap::new();
+        // Simulate gviz returning Sheet1's (empty) doc for every named tab.
+        grids.insert(ANON_TAB_META.into(), Vec::new());
+        grids.insert(ANON_TAB_CLASSES.into(), vec![vec!["stray".into()]]);
+        grids.insert(ANON_TAB_INSTANCES.into(), vec![vec!["stray".into()]]);
+        let inv = anon_grids_to_inventory(&grids).unwrap();
+        assert!(inv.classes.is_empty());
+        assert!(inv.instances.is_empty());
+        assert_eq!(inv.next_id, 1);
     }
 
     #[test]
@@ -1888,25 +2132,76 @@ mod tests {
     }
 
     #[test]
-    fn anon_build_bundles_shape() {
-        let cells = vec![(1, 1, "v".to_string())];
-        let bundles = anon_build_bundles("mysid", 0, &cells);
+    fn anon_inner_add_sheet_matches_captured_shape() {
+        // Captured verbatim: add "Sheet2" gid 1645475122 at index 2.
+        let inner = anon_inner_add_sheet("1645475122", "Sheet2");
+        assert_eq!(
+            inner,
+            "[1,0,\"1645475122\",[[[0,0,\"Sheet2\"],[2,0,null,null,0],\
+             [3,0,null,null,null,0],[4,0,null,null,null,null,0],\
+             [5,0,null,null,null,null,null,0],[6,0,null,null,null,null,null,null,0]]],1000,26]"
+        );
+        // Captured verbatim: index positioner for index 2.
+        assert_eq!(anon_inner_add_index(2), "[[[[4,0,null,null,2]]]]");
+    }
+
+    #[test]
+    fn anon_build_bundles_set_cell_shape() {
+        let cmds = vec![AnonCmd::SetCell {
+            gid: ANON_GID_CLASSES.into(),
+            row: 1,
+            col: 1,
+            value: "v".into(),
+        }];
+        let bundles = anon_build_bundles("mysid", 0, &cmds);
         let v: Value = serde_json::from_str(&bundles).unwrap();
         assert_eq!(v[0]["sid"], "mysid");
         assert_eq!(v[0]["reqId"], 0);
         // commands[0] = [OP_BUNDLE, "<inner string>"]
         assert_eq!(v[0]["commands"][0][0], OP_BUNDLE);
         let inner = v[0]["commands"][0][1].as_str().unwrap();
-        assert_eq!(inner, anon_inner_set_cell(ANON_GID, 1, 1, "v"));
+        assert_eq!(inner, anon_inner_set_cell(ANON_GID_CLASSES, 1, 1, "v"));
     }
 
     #[test]
-    fn anon_build_bundles_multiple_cells() {
-        let cells = vec![(0, 0, "a".into()), (0, 1, "b".into()), (2, 3, "c".into())];
-        let bundles = anon_build_bundles("s", 4, &cells);
+    fn anon_build_bundles_add_sheet_then_set_cell() {
+        // A mixed bundle: an add-sheet command followed by a set-cell into it.
+        let cmds = vec![
+            AnonCmd::AddSheet {
+                gid: ANON_GID_CLASSES.into(),
+                name: ANON_TAB_CLASSES.into(),
+                index: 2,
+            },
+            AnonCmd::SetCell {
+                gid: ANON_GID_CLASSES.into(),
+                row: 0,
+                col: 0,
+                value: "name".into(),
+            },
+        ];
+        let bundles = anon_build_bundles("s", 4, &cmds);
         let v: Value = serde_json::from_str(&bundles).unwrap();
         assert_eq!(v[0]["reqId"], 4);
-        assert_eq!(v[0]["commands"].as_array().unwrap().len(), 3);
+        let cmds_arr = v[0]["commands"].as_array().unwrap();
+        assert_eq!(cmds_arr.len(), 2);
+        // First command is the compound add-sheet.
+        assert_eq!(cmds_arr[0][0], OP_ADD_SHEET);
+        assert_eq!(cmds_arr[0][1][0][0], OP_ADD_SHEET_BODY);
+        assert_eq!(cmds_arr[0][1][1][0], OP_ADD_SHEET_INDEX);
+        // Second is the set-cell.
+        assert_eq!(cmds_arr[1][0], OP_BUNDLE);
+    }
+
+    #[test]
+    fn anon_parse_tab_names_from_html() {
+        let html = "x<div class=\"goog-inline-block docs-sheet-tab-caption\">Sheet1</div>\
+                    y<span class=\"foo docs-sheet-tab-caption\">Classes</span>\
+                    z<div class=\"docs-sheet-tab-caption\">A&amp;B</div>";
+        let names = parse_html_tab_names(html);
+        assert!(names.contains("Sheet1"));
+        assert!(names.contains("Classes"));
+        assert!(names.contains("A&B"), "entities decoded");
+        assert!(!names.contains("Instances"));
     }
 
     #[test]
@@ -2358,25 +2653,39 @@ mod tests {
         )
     }
 
-    // --- fake transport for the anonymous (PublicUrl) flat-layout path -------
+    // --- fake transport for the anonymous (PublicUrl) multi-tab path ---------
 
-    /// A fake link-shared sheet held in memory as a flat [`Grid`]. It serves:
-    /// * `get_text`      (gviz CSV) -> the flat grid serialized to CSV;
-    /// * `get_browser`   (`/edit`)  -> minimal HTML carrying `"revision":N` and a
-    ///   server `"sid"`;
+    /// A fake link-shared sheet held in memory as a set of named tabs (each a
+    /// [`Grid`], also keyed by its gid). It serves:
+    /// * `get_text`      (gviz CSV) -> the named tab's grid as CSV (a *missing*
+    ///   tab silently serves the default first tab `Sheet1`, mimicking the real
+    ///   anonymous gviz fallback);
+    /// * `get_browser`   (`/edit`)  -> minimal HTML carrying `"revision":N`, a
+    ///   server `"sid"`, and one `docs-sheet-tab-caption` marker per existing tab;
     /// * `post_multipart`(`/save`)  -> parses the `bundles` field, applies each
-    ///   set-cell command to the grid, bumps the revision, returns a `/save`-shaped
-    ///   response. This drives the whole anonymous transact loop without a network.
+    ///   add-sheet (creates a tab keyed by gid+name) and set-cell command, bumps
+    ///   the revision, returns a `/save`-shaped response. This drives the whole
+    ///   anonymous multi-tab transact loop without a network.
     struct FakeAnonSheet {
-        grid: Mutex<Grid>,
+        /// tab name -> grid.
+        tabs: Mutex<BTreeMap<String, Grid>>,
+        /// gid -> tab name (so set-cell, addressed by gid, finds its tab).
+        gids: Mutex<BTreeMap<String, String>>,
         revision: Mutex<i64>,
         sid: String,
     }
 
     impl FakeAnonSheet {
-        fn new(inv: Inventory) -> Arc<Self> {
+        /// A brand-new link-shared sheet: just `Sheet1` (gid "0"), empty, like a
+        /// freshly link-shared sheet the multi-tab layout has never touched.
+        fn new(_inv: Inventory) -> Arc<Self> {
+            let mut tabs = BTreeMap::new();
+            tabs.insert("Sheet1".to_string(), Vec::new());
+            let mut gids = BTreeMap::new();
+            gids.insert("0".to_string(), "Sheet1".to_string());
             Arc::new(FakeAnonSheet {
-                grid: Mutex::new(inventory_to_flat_grid(&inv)),
+                tabs: Mutex::new(tabs),
+                gids: Mutex::new(gids),
                 revision: Mutex::new(6),
                 sid: "0123456789abcdef".to_string(),
             })
@@ -2384,6 +2693,21 @@ mod tests {
         fn revision(&self) -> i64 {
             *self.revision.lock().unwrap()
         }
+        /// Snapshot a named tab's grid (empty if absent).
+        fn tab(&self, name: &str) -> Grid {
+            self.tabs.lock().unwrap().get(name).cloned().unwrap_or_default()
+        }
+    }
+
+    /// Extract the `sheet=<name>` query parameter from a gviz URL (urldecoded).
+    fn gviz_tab_from_url(url: &str) -> String {
+        url.split("sheet=")
+            .nth(1)
+            .map(|s| {
+                let raw: String = s.chars().take_while(|&c| c != '&').collect();
+                url_decode(&raw)
+            })
+            .unwrap_or_default()
     }
 
     /// Serialize a grid to gviz-style CSV (quoting every cell, like gviz does),
@@ -2414,8 +2738,17 @@ mod tests {
     }
 
     impl Transport for Arc<FakeAnonSheet> {
-        fn get_text(&self, _url: &str) -> Result<String, StoreError> {
-            Ok(flat_grid_to_gviz_csv(&self.grid.lock().unwrap()))
+        fn get_text(&self, url: &str) -> Result<String, StoreError> {
+            let name = gviz_tab_from_url(url);
+            let tabs = self.tabs.lock().unwrap();
+            // Mimic the real anonymous gviz fallback: a missing named tab serves
+            // the default first sheet (Sheet1) instead of erroring.
+            let grid = tabs
+                .get(&name)
+                .or_else(|| tabs.get("Sheet1"))
+                .cloned()
+                .unwrap_or_default();
+            Ok(flat_grid_to_gviz_csv(&grid))
         }
         fn get_json(&self, _u: &str, _t: &str) -> Result<Value, StoreError> {
             unreachable!("anon path never calls get_json")
@@ -2425,8 +2758,18 @@ mod tests {
         }
         fn get_browser(&self, _url: &str) -> Result<String, StoreError> {
             let rev = *self.revision.lock().unwrap();
+            // Render one tab-caption marker per existing tab so the write path can
+            // discover which of Meta/Classes/Instances already exist.
+            let captions: String = self
+                .tabs
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|n| format!("<div class=\"docs-sheet-tab-caption\">{n}</div>"))
+                .collect();
             Ok(format!(
-                "<html>...\"revision\":{rev},\"sid\":\"{}\",\"oui\":\"ANONYMOUS_1\"...</html>",
+                "<html>...{captions}...\"revision\":{rev},\"sid\":\"{}\",\
+                 \"oui\":\"ANONYMOUS_1\"...</html>",
                 self.sid
             ))
         }
@@ -2446,18 +2789,41 @@ mod tests {
             let bundles_json = &rest[..end];
 
             let bundles: Value = serde_json::from_str(bundles_json).expect("bundles JSON");
-            let mut grid = self.grid.lock().unwrap();
+            let mut tabs = self.tabs.lock().unwrap();
+            let mut gids = self.gids.lock().unwrap();
             for bundle in bundles.as_array().unwrap() {
                 for cmd in bundle["commands"].as_array().unwrap() {
-                    // cmd = [OP_BUNDLE, "<inner JSON string>"]
+                    let op = cmd[0].as_i64().unwrap();
+                    if op == OP_ADD_SHEET {
+                        // cmd = [OP_ADD_SHEET, [[OP_ADD_SHEET_BODY, "<body>"], ...]]
+                        let body_str = cmd[1][0][1].as_str().unwrap();
+                        let inner: Value = serde_json::from_str(body_str).unwrap();
+                        // inner = [1,0,"<gid>",[[[0,0,"<name>"],...]],1000,26]
+                        let gid = inner[2].as_str().unwrap().to_string();
+                        let name = inner[3][0][0][2].as_str().unwrap().to_string();
+                        assert!(
+                            !tabs.contains_key(&name),
+                            "add-sheet for already-existing tab {name:?}"
+                        );
+                        tabs.insert(name.clone(), Vec::new());
+                        gids.insert(gid, name);
+                        continue;
+                    }
+                    // cmd = [OP_BUNDLE, "<inner JSON string>"] (set-cell)
                     let inner_str = cmd[1].as_str().unwrap();
                     let inner: Value = serde_json::from_str(inner_str).unwrap();
                     // inner[0] = [gid, row, row+1, col, col+1]
                     let coords = inner[0].as_array().unwrap();
+                    let gid = coords[0].as_str().unwrap().to_string();
                     let row = coords[1].as_i64().unwrap() as usize;
                     let c = coords[3].as_i64().unwrap() as usize;
                     // inner[1] = [OP_SET_CELL, 3, [2, "<v>"], ...]
                     let v = inner[1][2][1].as_str().unwrap().to_string();
+                    let name = gids
+                        .get(&gid)
+                        .cloned()
+                        .unwrap_or_else(|| panic!("set-cell on unknown gid {gid:?}"));
+                    let grid = tabs.entry(name).or_default();
                     while grid.len() <= row {
                         grid.push(Vec::new());
                     }
@@ -2467,6 +2833,8 @@ mod tests {
                     grid[row][c] = v;
                 }
             }
+            drop(tabs);
+            drop(gids);
             let mut rev = self.revision.lock().unwrap();
             *rev += 1;
             let new = *rev;
@@ -2581,9 +2949,10 @@ mod tests {
 
     #[test]
     fn public_url_read_write_roundtrip_via_fake_anon_transport() {
-        // PublicUrl is now READ-WRITE: the anonymous flat-layout transact reads
-        // the gviz CSV, applies the closure, and writes back via the /edit+/save
-        // protocol. A fake transport models the sheet as a flat grid in memory.
+        // PublicUrl is now READ-WRITE: the anonymous multi-tab transact reads the
+        // gviz CSV of each tab, applies the closure, and writes back via the
+        // /edit+/save protocol (creating the Meta/Classes/Instances tabs). A fake
+        // transport models the sheet as a set of named tabs in memory.
         let fake = FakeAnonSheet::new(Inventory::new());
         let store = GSheetStore::with_transport(
             Access::PublicUrl {
@@ -2609,11 +2978,29 @@ mod tests {
         assert_eq!(back.get(1).unwrap().name, "thing");
         // The revision advanced on the underlying fake.
         assert!(fake.revision() > 6);
+
+        // The three tabs now exist as SEPARATE grids, and the instance lives on
+        // the Instances tab (not Classes/Meta).
+        for tab in [ANON_TAB_META, ANON_TAB_CLASSES, ANON_TAB_INSTANCES] {
+            assert!(!fake.tab(tab).is_empty(), "tab {tab} should exist with a header");
+        }
+        let instances = fake.tab(ANON_TAB_INSTANCES);
+        assert_eq!(instances[0], anon_instances_header());
+        assert!(
+            instances.iter().skip(1).any(|r| r.get(2).map(String::as_str) == Some("thing")),
+            "instance 'thing' is on the Instances tab"
+        );
+        let classes = fake.tab(ANON_TAB_CLASSES);
+        assert_eq!(classes[0], anon_classes_header());
+        assert!(
+            classes.iter().skip(1).any(|r| r.first().map(String::as_str) == Some("Item")),
+            "class 'Item' is on the Classes tab"
+        );
     }
 
     #[test]
     fn public_anon_lossless_roundtrip_rich_inventory() {
-        // The full rich inventory round-trips through the flat-layout anon path.
+        // The full rich inventory round-trips through the multi-tab anon path.
         let fake = FakeAnonSheet::new(Inventory::new());
         let store = GSheetStore::with_transport(
             Access::PublicUrl {
@@ -2630,7 +3017,7 @@ mod tests {
             })
             .expect("write rich inventory");
         let back = store.load().expect("reload rich inventory");
-        assert_eq!(back, inv, "anon flat-layout round-trip is lossless");
+        assert_eq!(back, inv, "anon multi-tab round-trip is lossless");
     }
 
     #[test]
@@ -2666,10 +3053,10 @@ mod tests {
 
     #[test]
     fn public_blank_sheet_reads_as_empty_inventory() {
-        // A brand-new blank link-shared sheet (gviz returns an empty document) now
-        // reads back as an empty inventory — not an error — because the flat layout
-        // tolerates a never-written `Sheet1` and the anon path can initialize it on
-        // first write.
+        // A brand-new blank link-shared sheet (gviz returns an empty document for
+        // every tab) now reads back as an empty inventory — not an error — because
+        // the multi-tab layout tolerates never-written Meta/Classes/Instances tabs
+        // and the anon path creates them on first write.
 
         /// A fake transport whose gviz CSV read returns an empty document.
         struct BlankPublic;

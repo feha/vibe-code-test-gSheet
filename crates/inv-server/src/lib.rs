@@ -173,6 +173,13 @@ pub enum Op {
         kind: String,
         target: i64,
     },
+    ChangeClass {
+        id: i64,
+        new_class: String,
+    },
+    DeleteClass {
+        name: String,
+    },
 }
 
 impl Op {
@@ -207,6 +214,8 @@ impl Op {
             Op::RemoveRelationship { id, kind, target } => {
                 inv.remove_relationship(id, &kind, target, now)
             }
+            Op::ChangeClass { id, new_class } => inv.change_class(id, &new_class, now),
+            Op::DeleteClass { name } => inv.delete_class(&name),
         }
     }
 }
@@ -242,7 +251,9 @@ pub struct PhotoPutQuery {
 /// Map a [`CoreError`] to an HTTP status + message.
 fn core_status(e: &CoreError) -> StatusCode {
     match e {
-        CoreError::WouldCycle | CoreError::InvalidParent(_) => StatusCode::CONFLICT,
+        CoreError::WouldCycle | CoreError::InvalidParent(_) | CoreError::ClassInUse => {
+            StatusCode::CONFLICT
+        }
         CoreError::NotFound(_) => StatusCode::NOT_FOUND,
     }
 }

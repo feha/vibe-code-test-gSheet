@@ -6,7 +6,7 @@ use leptos::prelude::*;
 use web_sys::HtmlInputElement;
 
 use crate::api::{GSheetMode, StoreDescriptor};
-use crate::components::{AddForm, DetailPanel, Navigator, SearchBar};
+use crate::components::{AddForm, ClassList, DetailPanel, Navigator, SearchBar};
 use crate::state::{AppState, ToastKind};
 
 /// Root component. Provides [`AppState`] and switches between the open-database
@@ -239,6 +239,7 @@ fn Workspace() -> impl IntoView {
                 <aside class="sidebar">
                     <AddForm/>
                     <SearchBar/>
+                    <ClassList/>
                     <Navigator/>
                 </aside>
                 <main class="main-panel">

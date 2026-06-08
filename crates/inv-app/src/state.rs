@@ -239,6 +239,23 @@ impl AppState {
         );
     }
 
+    // -- classes ------------------------------------------------------------
+
+    /// Change the class of an instance. Errors (e.g. `NotFound`) surface via toast.
+    pub fn change_class(&self, id: i64, new_class: String) {
+        self.run_op(Op::ChangeClass { id, new_class }, |state, _| {
+            state.info("Class changed")
+        });
+    }
+
+    /// Delete a class by name. A class still referenced by an instance is rejected
+    /// by the gateway (`ClassInUse` -> HTTP 409), surfaced here as an error toast.
+    pub fn delete_class(&self, name: String) {
+        self.run_op(Op::DeleteClass { name }, |state, _| {
+            state.info("Class deleted")
+        });
+    }
+
     // -- photos -------------------------------------------------------------
 
     /// Upload photo bytes for `id`, then attach the photo via an edit so the

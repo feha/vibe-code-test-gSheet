@@ -144,6 +144,13 @@ pub enum Op {
         kind: String,
         target: i64,
     },
+    ChangeClass {
+        id: i64,
+        new_class: String,
+    },
+    DeleteClass {
+        name: String,
+    },
 }
 
 /// Body of `POST /api/op`.

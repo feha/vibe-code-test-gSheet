@@ -73,7 +73,13 @@ fn Header(inst: Instance) -> impl IntoView {
     let state = AppState::expect();
     let id = inst.id;
     let name = RwSignal::new(inst.name.clone());
-    let class = inst.class.clone();
+    let current_class = inst.class.clone();
+    // Editable class draft, seeded with the instance's current class. A datalist
+    // suggests existing class names while still allowing a brand-new name.
+    let class_draft = RwSignal::new(inst.class.clone());
+    let class_for_compare = inst.class.clone();
+    let class_list_id = format!("class-suggest-{id}");
+    let class_list_id_input = class_list_id.clone();
 
     let save = move |_| {
         let new_name = name.get();
@@ -84,9 +90,23 @@ fn Header(inst: Instance) -> impl IntoView {
         state.edit_instance(id, Some(new_name), BTreeMap::new(), Vec::new());
     };
 
+    let change_class = move |_| {
+        let new_class = class_draft.get();
+        let new_class = new_class.trim().to_string();
+        if new_class.is_empty() {
+            state.error("Class cannot be empty");
+            return;
+        }
+        if new_class == class_for_compare {
+            state.error("Already this class");
+            return;
+        }
+        state.change_class(id, new_class);
+    };
+
     view! {
         <div>
-            <div class="muted" style="margin-bottom:6px;">{class}" #"{id}</div>
+            <div class="muted" style="margin-bottom:6px;">{current_class}" #"{id}</div>
             <div style="display:flex; gap:8px; align-items:center;">
                 <input
                     class="text-input"
@@ -96,6 +116,27 @@ fn Header(inst: Instance) -> impl IntoView {
                     on:input=move |ev| name.set(input_value(&ev))
                 />
                 <button class="btn btn-primary" on:click=save>"Rename"</button>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+                <input
+                    class="text-input"
+                    style="margin-bottom:0; width:160px;"
+                    r#type="text"
+                    list=class_list_id_input
+                    placeholder="class"
+                    prop:value=move || class_draft.get()
+                    on:input=move |ev| class_draft.set(input_value(&ev))
+                />
+                <datalist id=class_list_id>
+                    <For
+                        each=move || state.class_names()
+                        key=|name| name.clone()
+                        let:name
+                    >
+                        <option value=name.clone()>{name.clone()}</option>
+                    </For>
+                </datalist>
+                <button class="btn btn-ghost" on:click=change_class>"Change class"</button>
             </div>
         </div>
     }
