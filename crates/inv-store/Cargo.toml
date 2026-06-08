@@ -23,7 +23,12 @@ r2d2_postgres = { version = "0.18", optional = true }
 # when that runtime is dropped inside the gateway's `spawn_blocking` context),
 # `ureq` does pure blocking I/O with no internal async runtime, so it is safe to
 # call from within tokio's blocking pool.
-ureq = { version = "2", features = ["json"] }
+#
+# The `cookies` feature gives the agent an automatic cookie jar (an
+# `AgentBuilder` always installs a `CookieTin` when the feature is on), so the
+# COMPASS/NID cookies set by the anonymous `/edit` GET are replayed on the
+# subsequent `/bind` and `/save` POSTs that make up the no-OAuth write protocol.
+ureq = { version = "2", features = ["json", "cookies"] }
 # CSV parsing for reading published / link-shared ("public URL") Google Sheets,
 # which export as CSV. Declared now so the next agent only edits src/gsheet.rs.
 csv = "1"

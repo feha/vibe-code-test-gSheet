@@ -52,22 +52,32 @@
 //! No secret ever travels on the wire (see [`crate::GSheetMode`]); credentials are
 //! resolved **server-side** from the environment:
 //!
-//! * **`PublicUrl`** — READ-ONLY over a published / link-shared sheet, via the
-//!   unauthenticated gviz CSV export endpoint. Needs no credential. Writes return
-//!   [`StoreError::Backend`].
+//! * **`PublicUrl`** — READ-**WRITE** over a link-shared ("anyone with link can
+//!   edit") sheet with NO credential. Reads use the unauthenticated gviz CSV
+//!   export; writes replicate the Sheets web-editor's anonymous `/edit` + `/save`
+//!   protocol (cookies only). To keep the write opcode surface to just the
+//!   captured "set one cell to a string" command, this mode uses a **single-sheet
+//!   flat layout** on `Sheet1` (see the "Single-sheet flat layout" section) rather
+//!   than the multi-tab native layout. The flat layout round-trips losslessly
+//!   through both gviz CSV and the `/save` writer.
 //! * **`OAuth`** — read/write via Sheets API v4 with an OAuth access token read
 //!   from `INV_GSHEET_TOKEN` (or an OAuth client from `INV_GSHEET_OAUTH_CLIENT`).
+//!   Uses the multi-tab native layout above.
 //! * **`AppHosted`** — read/write with a service account from
 //!   `INV_GSHEET_SERVICE_ACCOUNT`; a missing `spreadsheet_id` means "create a new
-//!   spreadsheet for me".
+//!   spreadsheet for me". Uses the multi-tab native layout above.
 //!
 //! ## Testability
 //!
-//! The grid mapping, CSV parsing, URL/id parsing, and the optimistic-retry
-//! decision are all pure / fake-transport-driven so they are unit-tested without a
-//! network. The live network path uses [`UreqTransport`] and is **UNVERIFIED**
-//! in this environment (no Google credentials); its end-to-end test is
-//! `#[ignore]` and self-skips when creds are absent.
+//! The grid mappings (multi-tab AND flat), CSV parsing, URL/id parsing, the
+//! anonymous command/bundle encoding, the revision/sid HTML parsing, the save
+//! response parsing, and the optimistic-retry decision are all pure /
+//! fake-transport-driven so they are unit-tested without a network. The OAuth /
+//! AppHosted live path uses [`UreqTransport`] and is **UNVERIFIED** (no Google
+//! credentials). The anonymous PublicUrl live path is **VERIFIED** against a real
+//! link-shared sheet by an `#[ignore]`d integration test (see
+//! `tests/gsheet_anon_live.rs`); the probe in `examples/gsheet_probe.rs` proved it
+//! end to end.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -564,6 +574,334 @@ fn version_from_grids(grids: &BTreeMap<String, Grid>) -> u64 {
 }
 
 // ===========================================================================
+// Anonymous (no-OAuth) read-WRITE protocol for link-shared sheets.
+//
+// This replicates the Sheets web-editor's private `save` protocol, captured from
+// a live anonymous browser session. Unlike the Sheets API v4 (which needs an
+// OAuth token), it writes to a sheet shared "anyone with link can edit" using
+// only the cookies the editor itself hands an anonymous visitor.
+//
+// PROVEN protocol (re-captured live; simpler than the first reverse-engineering
+// notes suggested):
+//
+//   1. GET  /spreadsheets/d/<ID>/edit  -> Set-Cookie (COMPASS, NID) into the
+//      agent's cookie jar; the HTML carries the current revision as
+//      `"revision":<N>` and the **server-assigned** session id as `"sid":"<hex>"`.
+//   2. POST /spreadsheets/d/<ID>/save  -> a `multipart/form-data` body of
+//      {rev=<N>, bundles=<JSON>}; on success HTTP 200 and the revision advances.
+//
+// Two corrections vs. the original capture notes, both verified live:
+//   * the `sid` is NOT client-chosen — only the sid the server put in the `/edit`
+//     HTML is accepted (a random sid -> HTTP 400/550);
+//   * the separate `/bind` handshake is NOT needed for a batch write (it returns
+//     400 for a fresh page session, yet `/save` still succeeds).
+// ===========================================================================
+
+/// Outer command tag wrapping one cell mutation in a `bundles` command list.
+///
+/// MAGIC, build-version-tied: captured from build
+/// `editors.spreadsheets-frontend_20260601`. If Google ships a new editor build
+/// this opcode may change and must be re-captured from a live browser `/save`.
+const OP_BUNDLE: i64 = 21299578;
+
+/// Inner "set one cell" mutation tag inside a command.
+///
+/// MAGIC, build-version-tied (see [`OP_BUNDLE`]); re-capture on editor updates.
+const OP_SET_CELL: i64 = 132274236;
+
+/// The single tab we read/write in anonymous mode. A link-shared sheet starts
+/// with exactly one tab named `Sheet1`; the anonymous `/save` opcode only
+/// addresses cells of an existing grid, so we keep everything on this one tab.
+const ANON_SHEET_NAME: &str = "Sheet1";
+
+/// The grid id of the first tab. The set-cell command addresses a grid by this
+/// string id; the default first sheet is always `"0"`.
+const ANON_GID: &str = "0";
+
+/// Parse the current revision from the `/edit` HTML (`"revision":<N>`).
+fn parse_html_revision(html: &str) -> Option<i64> {
+    let needle = "\"revision\":";
+    let i = html.find(needle)? + needle.len();
+    let digits: String = html[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Parse the server-assigned session id from the `/edit` HTML (`"sid":"<hex>"`).
+/// This is the only sid `/save` accepts.
+fn parse_html_sid(html: &str) -> Option<String> {
+    let needle = "\"sid\":\"";
+    let i = html.find(needle)? + needle.len();
+    let val: String = html[i..].chars().take_while(|&c| c != '"').collect();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+/// Build the INNER (double-encoded) set-cell command string for a 0-based
+/// `(row, col)` on grid `gid`, setting it to the string `v`.
+///
+/// The shape is the captured-verbatim command for "set one cell to a string":
+/// `[[<gid>,row,row+1,col,col+1],[OP_SET_CELL,3,[2,"<v>"],null,null,0],
+///   [null,[[null,513,[0],null,...,0]]]]`.
+/// The `[2,"<v>"]` is the type-tagged value (tag 2 == string); ALL values are
+/// written as strings, so numbers/bools/dates are stringified by the layout.
+fn anon_inner_set_cell(gid: &str, row: i64, col: i64, v: &str) -> String {
+    let n = Value::Null;
+    serde_json::json!([
+        [gid, row, row + 1, col, col + 1],
+        [OP_SET_CELL, 3, [2, v], n, n, 0],
+        [n, [[n, 513, [0], n, n, n, n, n, n, n, n, 0]]]
+    ])
+    .to_string()
+}
+
+/// Build the `bundles` POST field: a JSON array carrying one command per cell.
+/// `[{"commands":[[OP_BUNDLE,"<inner>"], ...],"sid":"<sid>","reqId":<id>}]`.
+fn anon_build_bundles(sid: &str, req_id: i64, cells: &[(i64, i64, String)]) -> String {
+    let commands: Vec<Value> = cells
+        .iter()
+        .map(|(r, c, v)| serde_json::json!([OP_BUNDLE, anon_inner_set_cell(ANON_GID, *r, *c, v)]))
+        .collect();
+    serde_json::json!([{ "commands": commands, "sid": sid, "reqId": req_id }]).to_string()
+}
+
+/// Encode a `multipart/form-data` body from string fields.
+/// Returns `(content_type_header_value, body_bytes)`.
+fn anon_multipart(fields: &[(&str, &str)]) -> (String, Vec<u8>) {
+    // A boundary token unlikely to appear in JSON field values.
+    let boundary = "----invstoreGSheetAnon7e1081f93830126";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// Build the anonymous `/edit` URL for a spreadsheet id.
+fn anon_edit_url(id: &str) -> String {
+    format!("https://docs.google.com/spreadsheets/d/{id}/edit")
+}
+
+/// Build the anonymous `/save` URL for a spreadsheet id and (server) sid.
+fn anon_save_url(id: &str, sid: &str) -> String {
+    format!(
+        "https://docs.google.com/spreadsheets/d/{id}/save?\
+         id={id}&sid={sid}&vc=1&c=1&w=1&flr=0&smv=2147483647&smb=%5B2147483647%2C%20APxr%5D\
+         &includes_info_params=true&cros_files=false&nded=false"
+    )
+}
+
+/// A `/save` response is `)]}'` then JSON; the revision advanced when the JSON
+/// carries a `revisionRanges`. Returns the highest committed revision, or an
+/// error if the body looks like a channel error (`["er",...]`).
+fn parse_save_response(text: &str) -> Result<i64, StoreError> {
+    let json = text.trim_start_matches(")]}'").trim();
+    if json.starts_with("[[\"er\"") || json.contains("[\"er\",") {
+        return Err(StoreError::Backend(format!(
+            "gsheet anonymous save rejected by server: {json}"
+        )));
+    }
+    let v: Value = serde_json::from_str(json)
+        .map_err(|e| StoreError::Backend(format!("gsheet: bad save response {json:?}: {e}")))?;
+    // revisionRanges: [[lo,hi], ...]; take the maximum hi.
+    let hi = v
+        .get("revisionRanges")
+        .and_then(Value::as_array)
+        .and_then(|ranges| {
+            ranges
+                .iter()
+                .filter_map(|r| r.as_array().and_then(|p| p.get(1)).and_then(Value::as_i64))
+                .max()
+        });
+    hi.ok_or_else(|| {
+        StoreError::Backend(format!(
+            "gsheet: save response carried no revisionRanges: {json}"
+        ))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Single-sheet flat layout (anonymous mode).
+//
+// The whole Inventory lives on ONE tab (`Sheet1`) as a flat list of records, so
+// the gviz CSV read and the cell-by-cell `/save` write agree on the same shape
+// (a lossless round-trip). Column A is a record-type tag; the remaining columns
+// are positional per record type. Everything is a string; structured parts
+// (field defs / field values / relationships / photos) are JSON-encoded so they
+// never collide with the column delimiter and never get number-coerced by gviz.
+//
+//   A=META  | B=next_id | C=version
+//   A=CLASS | B=name    | C=created_at | D=fields_json
+//   A=INST  | B=id | C=class | D=name | E=parent | F=tags_json
+//           | G=fields_json | H=rels_json | I=photos_json
+//           | J=created_at | K=updated_at
+//
+// `fields_json` on CLASS is `[{ "name","field_type","required" }, ...]`.
+// `fields_json` on INST is `{ "<name>": <FieldValue-as-serde>, ... }`.
+// `tags_json`   is a JSON array of strings.
+// `rels_json`   is `[{ "kind","target" }, ...]`; `photos_json` is
+//               `[{ "key","mime","name" }, ...]`. All use the model's own serde.
+// ---------------------------------------------------------------------------
+
+/// Record-type tags occupying column A.
+const REC_META: &str = "META";
+const REC_CLASS: &str = "CLASS";
+const REC_INST: &str = "INST";
+
+/// Fixed width of the flat grid (the widest record, INST, has 11 columns). Every
+/// emitted row is padded to this width so the write blanks stale trailing cells.
+const FLAT_WIDTH: usize = 11;
+
+/// Serialize the whole [`Inventory`] into the single flat grid (no header row).
+/// Inverse of [`flat_grid_to_inventory`].
+fn inventory_to_flat_grid(inv: &Inventory) -> Grid {
+    let mut grid: Grid = Vec::new();
+
+    let mut push = |cells: Vec<String>| {
+        let mut row = cells;
+        row.resize(FLAT_WIDTH, String::new());
+        grid.push(row);
+    };
+
+    // META (always first).
+    push(vec![
+        REC_META.into(),
+        inv.next_id.to_string(),
+        SCHEMA_VERSION.to_string(),
+    ]);
+
+    // One CLASS row per class (ordered by name via BTreeMap).
+    for class in inv.classes.values() {
+        let fields_json = serde_json::to_string(&class.fields).unwrap_or_else(|_| "[]".into());
+        push(vec![
+            REC_CLASS.into(),
+            class.name.clone(),
+            class.created_at.to_string(),
+            fields_json,
+        ]);
+    }
+
+    // One INST row per instance (ordered by id via BTreeMap).
+    for inst in inv.instances.values() {
+        let tags_json = serde_json::to_string(&inst.tags).unwrap_or_else(|_| "[]".into());
+        let fields_json = serde_json::to_string(&inst.fields).unwrap_or_else(|_| "{}".into());
+        let rels_json = serde_json::to_string(&inst.relationships).unwrap_or_else(|_| "[]".into());
+        let photos_json = serde_json::to_string(&inst.photos).unwrap_or_else(|_| "[]".into());
+        push(vec![
+            REC_INST.into(),
+            inst.id.to_string(),
+            inst.class.clone(),
+            inst.name.clone(),
+            encode_opt_id(inst.parent),
+            tags_json,
+            fields_json,
+            rels_json,
+            photos_json,
+            inst.created_at.to_string(),
+            inst.updated_at.to_string(),
+        ]);
+    }
+
+    grid
+}
+
+/// Fetch column `i` of a row as `&str`, tolerating short rows (gviz trims
+/// trailing empties).
+fn col(row: &[String], i: usize) -> &str {
+    row.get(i).map(String::as_str).unwrap_or("")
+}
+
+/// Reconstruct an [`Inventory`] from the single flat grid. Inverse of
+/// [`inventory_to_flat_grid`]. Unknown/blank rows are skipped; a missing META row
+/// defaults `next_id` to 1 (so a never-written sheet reads as empty).
+fn flat_grid_to_inventory(grid: &Grid) -> Result<Inventory, StoreError> {
+    let mut inv = Inventory::new();
+
+    for row in grid {
+        match col(row, 0) {
+            REC_META => {
+                let next = col(row, 1).trim();
+                if !next.is_empty() {
+                    inv.next_id = next.parse::<i64>().map_err(|e| {
+                        StoreError::Backend(format!("gsheet: bad next_id {next:?}: {e}"))
+                    })?;
+                }
+            }
+            REC_CLASS => {
+                let name = col(row, 1).to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let created_at = parse_id(col(row, 2), "class created_at")?;
+                let fields: Vec<FieldDef> = parse_json_cell(col(row, 3), "class fields")?;
+                inv.classes.insert(
+                    name.clone(),
+                    Class {
+                        name,
+                        fields,
+                        created_at,
+                    },
+                );
+            }
+            REC_INST => {
+                let id = parse_id(col(row, 1), "instance")?;
+                let class = col(row, 2).to_string();
+                let name = col(row, 3).to_string();
+                let parent = decode_opt_id(col(row, 4))?;
+                let tags: BTreeSet<String> = parse_json_cell(col(row, 5), "instance tags")?;
+                let fields: BTreeMap<String, FieldValue> =
+                    parse_json_cell(col(row, 6), "instance fields")?;
+                let relationships: Vec<Relationship> =
+                    parse_json_cell(col(row, 7), "instance relationships")?;
+                let photos: Vec<Photo> = parse_json_cell(col(row, 8), "instance photos")?;
+                let created_at = parse_id(col(row, 9), "instance created_at")?;
+                let updated_at = parse_id(col(row, 10), "instance updated_at")?;
+                inv.instances.insert(
+                    id,
+                    Instance {
+                        id,
+                        class,
+                        name,
+                        fields,
+                        tags,
+                        parent,
+                        photos,
+                        relationships,
+                        created_at,
+                        updated_at,
+                    },
+                );
+            }
+            // Blank or unknown rows (e.g. gviz padding) are ignored.
+            _ => {}
+        }
+    }
+
+    Ok(inv)
+}
+
+/// Parse a JSON cell into `T`, defaulting an empty cell to `T::default()`.
+fn parse_json_cell<T>(cell: &str, ctx: &str) -> Result<T, StoreError>
+where
+    T: serde::de::DeserializeOwned + Default,
+{
+    let t = cell.trim();
+    if t.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_str(t)
+        .map_err(|e| StoreError::Backend(format!("gsheet: bad {ctx} JSON {cell:?}: {e}")))
+}
+
+// ===========================================================================
 // CSV parsing (for the unauthenticated gviz/CSV export of public sheets).
 // ===========================================================================
 
@@ -837,7 +1175,32 @@ trait Transport: Send + Sync {
     /// `POST url` with an OAuth bearer `token` and JSON `body`, returning the
     /// parsed JSON response.
     fn post_json(&self, url: &str, token: &str, body: &Value) -> Result<Value, StoreError>;
+
+    /// `GET url` like a browser: send a browser User-Agent and `x-same-domain: 1`,
+    /// and *persist any Set-Cookie into the shared cookie jar* so the subsequent
+    /// `post_multipart` replays them. Returns the raw response text.
+    ///
+    /// Used by the anonymous (no-OAuth) write path to fetch `/edit` (capturing the
+    /// COMPASS/NID cookies + the server-assigned sid and revision).
+    fn get_browser(&self, url: &str) -> Result<String, StoreError>;
+
+    /// `POST url` like a browser: a `multipart/form-data` body with a browser
+    /// User-Agent, `x-same-domain: 1`, and the jarred cookies. Returns the raw
+    /// response text. Used by the anonymous write path to call `/save`.
+    fn post_multipart(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<String, StoreError>;
 }
+
+/// Browser-like User-Agent. Google's private editor endpoints (`/edit`, `/save`)
+/// throttle/refuse non-browser agents, so the anonymous write path must look like
+/// a browser.
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                          AppleWebKit/537.36 (KHTML, like Gecko) \
+                          Chrome/126.0.0.0 Safari/537.36";
 
 /// The live [`Transport`] over [`ureq`].
 ///
@@ -846,11 +1209,22 @@ trait Transport: Send + Sync {
 /// inside the gateway's `spawn_blocking` context — it is safe to call from
 /// within tokio's blocking pool. This is the entire reason the backend uses
 /// `ureq` instead of `reqwest`.
-struct UreqTransport;
+///
+/// The held [`ureq::Agent`] carries an automatic cookie jar (enabled by the
+/// `cookies` feature). The anonymous write protocol depends on this: the
+/// COMPASS/NID cookies set by `GET /edit` are replayed on the `POST /save` that
+/// follows.
+struct UreqTransport {
+    agent: ureq::Agent,
+}
 
 impl UreqTransport {
     fn new() -> Result<Self, StoreError> {
-        Ok(UreqTransport)
+        let agent = ureq::AgentBuilder::new()
+            .user_agent(BROWSER_UA)
+            .redirects(5)
+            .build();
+        Ok(UreqTransport { agent })
     }
 }
 
@@ -875,7 +1249,9 @@ fn ureq_error(verb: &str, url: &str, err: ureq::Error) -> StoreError {
 
 impl Transport for UreqTransport {
     fn get_text(&self, url: &str) -> Result<String, StoreError> {
-        let resp = ureq::get(url)
+        let resp = self
+            .agent
+            .get(url)
             .call()
             .map_err(|e| ureq_error("GET", url, e))?;
         resp.into_string()
@@ -883,7 +1259,9 @@ impl Transport for UreqTransport {
     }
 
     fn get_json(&self, url: &str, token: &str) -> Result<Value, StoreError> {
-        let resp = ureq::get(url)
+        let resp = self
+            .agent
+            .get(url)
             .set("Authorization", &auth_header(token))
             .call()
             .map_err(|e| ureq_error("GET", url, e))?;
@@ -892,12 +1270,43 @@ impl Transport for UreqTransport {
     }
 
     fn post_json(&self, url: &str, token: &str, body: &Value) -> Result<Value, StoreError> {
-        let resp = ureq::post(url)
+        let resp = self
+            .agent
+            .post(url)
             .set("Authorization", &auth_header(token))
             .send_json(body.clone())
             .map_err(|e| ureq_error("POST", url, e))?;
         resp.into_json::<Value>()
             .map_err(|e| StoreError::Backend(format!("gsheet: decode POST {url}: {e}")))
+    }
+
+    fn get_browser(&self, url: &str) -> Result<String, StoreError> {
+        // The agent already sends BROWSER_UA and jars Set-Cookie automatically.
+        let resp = self
+            .agent
+            .get(url)
+            .set("x-same-domain", "1")
+            .call()
+            .map_err(|e| ureq_error("GET", url, e))?;
+        resp.into_string()
+            .map_err(|e| StoreError::Backend(format!("gsheet: read GET {url}: {e}")))
+    }
+
+    fn post_multipart(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<String, StoreError> {
+        let resp = self
+            .agent
+            .post(url)
+            .set("content-type", content_type)
+            .set("x-same-domain", "1")
+            .send_bytes(body)
+            .map_err(|e| ureq_error("POST", url, e))?;
+        resp.into_string()
+            .map_err(|e| StoreError::Backend(format!("gsheet: read POST {url}: {e}")))
     }
 }
 
@@ -908,11 +1317,15 @@ impl Transport for UreqTransport {
 /// Which access mode a [`GSheetStore`] was constructed for, with its
 /// server-resolved credential and target.
 enum Access {
-    /// Read-only over a published / link-shared sheet. No credential. The raw
-    /// public URL is kept and the spreadsheet id is parsed lazily at read time,
-    /// so constructing the store never fails (matching the factory contract that
-    /// a public URL always `open`s; an unparseable URL surfaces as a
-    /// [`StoreError::Backend`] from the first `load`).
+    /// Read **and write** a link-shared sheet ("anyone with link can edit") with
+    /// NO credential. The raw public URL is kept and the spreadsheet id is parsed
+    /// lazily at read time, so constructing the store never fails (matching the
+    /// factory contract that a public URL always `open`s; an unparseable URL
+    /// surfaces as a [`StoreError::Backend`] from the first `load`).
+    ///
+    /// Reads use the unauthenticated gviz CSV export; writes use the anonymous
+    /// `/edit` + `/save` editor protocol (see the "Anonymous read-WRITE protocol"
+    /// section). Both speak the SINGLE-sheet flat layout on `Sheet1`.
     PublicUrl { url: String },
     /// Read/write a private sheet with a server-side OAuth access `token`.
     OAuth {
@@ -950,10 +1363,13 @@ fn read_env_credential(var: &str) -> Option<String> {
 }
 
 impl GSheetStore {
-    /// Open a READ-ONLY store over a published / link-shared sheet at `url`.
+    /// Open a READ-WRITE store over a link-shared ("anyone with link can edit")
+    /// sheet at `url`, with NO credential.
     ///
-    /// No credential is required. The spreadsheet id is parsed from the URL and
-    /// tabs are read via the unauthenticated gviz CSV export endpoint.
+    /// The spreadsheet id is parsed from the URL. Reads use the unauthenticated
+    /// gviz CSV export; writes replicate the Sheets web-editor's anonymous
+    /// `/edit` + `/save` protocol (cookies only). Both use the single-sheet flat
+    /// layout on `Sheet1`.
     pub fn public_url(url: &str) -> Result<Self, StoreError> {
         Ok(GSheetStore {
             access: Access::PublicUrl {
@@ -1023,12 +1439,17 @@ impl GSheetStore {
     /// The list of tab names we always read/write (the special tabs plus a tab per
     /// known class). For a never-written sheet only the specials exist; class tabs
     /// are discovered from `_classes`.
+    ///
+    /// Only the OAuth / AppHosted (Sheets API v4) paths use the multi-tab grid
+    /// layout. The PublicUrl path uses the single-sheet flat layout via
+    /// [`read_public_inventory`] / [`write_public_inventory`] instead, and never
+    /// reaches here.
     fn read_all_grids(&self) -> Result<BTreeMap<String, Grid>, StoreError> {
         match &self.access {
-            Access::PublicUrl { url } => {
-                let id = parse_spreadsheet_id(url)?;
-                self.read_grids_public(&id)
-            }
+            Access::PublicUrl { .. } => unreachable!(
+                "PublicUrl uses the flat-layout read path (read_public_inventory), \
+                 not the multi-tab grid path"
+            ),
             Access::OAuth {
                 spreadsheet_id,
                 token,
@@ -1047,63 +1468,80 @@ impl GSheetStore {
         }
     }
 
-    /// Read all native tabs from a public sheet via the gviz CSV endpoint.
-    fn read_grids_public(&self, id: &str) -> Result<BTreeMap<String, Grid>, StoreError> {
-        // Discover class tabs from `_classes` first, then read each tab's CSV.
-        let mut grids: BTreeMap<String, Grid> = BTreeMap::new();
-        for special in [
-            TAB_CLASSES,
-            TAB_CLASS_FIELDS,
-            TAB_RELATIONSHIPS,
-            TAB_PHOTOS,
-            TAB_META,
-        ] {
-            // gviz answers a missing tab with an error document, not a 404, so a
-            // brand-new blank sheet (which has only the default "Sheet1" and none
-            // of our native tabs) reads back garbage rather than erroring per-tab.
-            // We tolerate that here and diagnose the missing structure once, below,
-            // with an actionable message instead of a cryptic CSV/parse error.
-            match self.transport.get_text(&gviz_csv_url(id, special)) {
-                Ok(csv) => {
-                    grids.insert(special.to_string(), parse_csv(&csv));
-                }
-                Err(_) => {
-                    grids.insert(special.to_string(), Grid::new());
-                }
+    // --- Anonymous (PublicUrl) flat-layout read/write -----------------------
+
+    /// Read the `Sheet1` flat grid of a link-shared sheet via gviz CSV and
+    /// reconstruct the [`Inventory`]. A never-written (blank) sheet reads back as
+    /// an empty inventory.
+    fn read_public_inventory(&self, id: &str) -> Result<Inventory, StoreError> {
+        let csv = self
+            .transport
+            .get_text(&gviz_csv_url(id, ANON_SHEET_NAME))?;
+        let grid = parse_csv(&csv);
+        flat_grid_to_inventory(&grid)
+    }
+
+    /// Write the full [`Inventory`] back to `Sheet1` of a link-shared sheet using
+    /// the anonymous `/edit` + `/save` editor protocol (no credential).
+    ///
+    /// Steps: GET `/edit` (jars cookies, parses the server `sid` + current
+    /// `revision`), then POST `/save` with one set-cell command per non-empty cell
+    /// of the new flat grid, plus blank commands for any cell that the previous
+    /// grid occupied beyond the new content (so the sheet shrinks correctly).
+    fn write_public_inventory(&self, id: &str, inv: &Inventory) -> Result<(), StoreError> {
+        // 1. GET /edit -> cookies + sid + revision.
+        let html = self.transport.get_browser(&anon_edit_url(id))?;
+        let rev = parse_html_revision(&html).ok_or_else(|| {
+            StoreError::Backend(
+                "gsheet anonymous write: could not parse \"revision\" from /edit HTML \
+                 (is the sheet reachable and link-shared?)"
+                    .to_string(),
+            )
+        })?;
+        let sid = parse_html_sid(&html).ok_or_else(|| {
+            StoreError::Backend(
+                "gsheet anonymous write: could not parse server \"sid\" from /edit HTML"
+                    .to_string(),
+            )
+        })?;
+
+        // 2. Compute the cell commands. We address every cell of the new grid
+        //    (writing "" for empties), plus blank any cell rows the OLD grid had
+        //    beyond the new row count, so trailing stale rows disappear.
+        let new_grid = inventory_to_flat_grid(inv);
+        let old_csv = self
+            .transport
+            .get_text(&gviz_csv_url(id, ANON_SHEET_NAME))
+            .unwrap_or_default();
+        let old_grid = parse_csv(&old_csv);
+
+        let mut cells: Vec<(i64, i64, String)> = Vec::new();
+        for (r, row) in new_grid.iter().enumerate() {
+            for (c, val) in row.iter().enumerate() {
+                cells.push((r as i64, c as i64, val.clone()));
             }
         }
-        // A correctly-initialized native sheet always carries the `_meta`
-        // `version` row. If it is absent, this sheet was never written by us
-        // (e.g. a fresh blank sheet shared as a public link). Public links are
-        // read-only, so we cannot initialize it here — tell the user how.
-        if read_meta_value(&grids, "version")
-            .ok()
-            .flatten()
-            .is_none()
-        {
-            return Err(StoreError::Backend(
-                "this Google Sheet has no inventory data yet; public links are \
-                 read-only — use the OAuth mode to initialize and write to a sheet"
-                    .to_string(),
-            ));
+        // Blank out trailing rows that existed before but not now.
+        for (r, old_row) in old_grid.iter().enumerate().skip(new_grid.len()) {
+            let old_cols = old_row.len().max(FLAT_WIDTH);
+            for c in 0..old_cols {
+                cells.push((r as i64, c as i64, String::new()));
+            }
         }
-        // Each class named in `_classes` gets its own tab read.
-        let class_names: Vec<String> = grids
-            .get(TAB_CLASSES)
-            .map(|g| {
-                let idx = header_index(g);
-                g.iter()
-                    .skip(1)
-                    .map(|r| cell(r, &idx, "name").to_string())
-                    .filter(|n| !n.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        for class in class_names {
-            let csv = self.transport.get_text(&gviz_csv_url(id, &class))?;
-            grids.insert(class, parse_csv(&csv));
+
+        // 3. POST /save.
+        let bundles = anon_build_bundles(&sid, 0, &cells);
+        let (ct, body) = anon_multipart(&[("rev", &rev.to_string()), ("bundles", &bundles)]);
+        let resp = self
+            .transport
+            .post_multipart(&anon_save_url(id, &sid), &ct, &body)?;
+        let new_rev = parse_save_response(&resp)?;
+        if new_rev <= rev {
+            return Err(StoreError::Backend(format!(
+                "gsheet anonymous write: revision did not advance (was {rev}, got {new_rev})"
+            )));
         }
-        Ok(grids)
+        Ok(())
     }
 
     /// Read all native tabs from a private sheet via the authenticated API.
@@ -1162,9 +1600,11 @@ impl GSheetStore {
         set_meta_version(&mut grids, new_version);
 
         match &self.access {
-            Access::PublicUrl { .. } => Err(StoreError::Backend(
-                "public-URL Google Sheets are read-only".to_string(),
-            )),
+            // PublicUrl writes go through write_public_inventory (flat layout),
+            // never the multi-tab grid path.
+            Access::PublicUrl { .. } => unreachable!(
+                "PublicUrl uses the flat-layout write path (write_public_inventory)"
+            ),
             Access::OAuth {
                 spreadsheet_id,
                 token,
@@ -1230,6 +1670,11 @@ fn set_meta_version(grids: &mut BTreeMap<String, Grid>, version: u64) {
 
 impl Store for GSheetStore {
     fn load(&self) -> Result<Inventory, StoreError> {
+        // PublicUrl uses the single-sheet flat layout (gviz read of `Sheet1`).
+        if let Access::PublicUrl { url } = &self.access {
+            let id = parse_spreadsheet_id(url)?;
+            return self.read_public_inventory(&id);
+        }
         let grids = self.read_all_grids()?;
         grids_to_inventory(&grids)
     }
@@ -1238,11 +1683,33 @@ impl Store for GSheetStore {
         &self,
         f: &mut dyn FnMut(&mut Inventory) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        // Public sheets are read-only; fail fast with a clear message.
-        if matches!(self.access, Access::PublicUrl { .. }) {
-            return Err(StoreError::Backend(
-                "public-URL Google Sheets are read-only".to_string(),
-            ));
+        // PublicUrl: anonymous (no-OAuth) read-modify-write over the flat layout.
+        //
+        // Sheets has no CAS, so this is the same optimistic loop as the API path,
+        // keyed on the on-sheet `next_id`-bearing inventory state rather than a
+        // separate version row: read, mutate, re-read to verify nothing changed,
+        // then write. (The save itself fails if the revision moved under us, so a
+        // racing write surfaces as a Backend error and we retry.)
+        if let Access::PublicUrl { url } = &self.access {
+            let id = parse_spreadsheet_id(url)?;
+            for _ in 0..MAX_ATTEMPTS {
+                let before = self.read_public_inventory(&id)?;
+                let mut inv = before.clone();
+                f(&mut inv)?;
+                // Optimistic verify: re-read; only write if unchanged meanwhile.
+                let observed = self.read_public_inventory(&id)?;
+                if observed != before {
+                    continue;
+                }
+                match self.write_public_inventory(&id, &inv) {
+                    Ok(()) => return Ok(()),
+                    // A stale revision (a concurrent committer) is reported by the
+                    // server; retry by reloading the latest state.
+                    Err(StoreError::Backend(m)) if m.contains("revision") => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            return Err(StoreError::Conflict);
         }
 
         for _ in 0..MAX_ATTEMPTS {
@@ -1371,6 +1838,110 @@ mod tests {
         assert_eq!(cell, "a,b", "sorted, comma-joined");
         assert_eq!(decode_tags(&cell), tags);
         assert!(decode_tags("").is_empty(), "empty cell -> no tags");
+    }
+
+    // --- anonymous protocol: pure encoding / parsing -----------------------
+
+    #[test]
+    fn anon_flat_grid_roundtrip_lossless() {
+        // The single-sheet flat layout round-trips an arbitrary inventory.
+        let inv = rich_inventory();
+        let grid = inventory_to_flat_grid(&inv);
+        let back = flat_grid_to_inventory(&grid).unwrap();
+        assert_eq!(inv, back, "flat layout: to ∘ from == identity");
+    }
+
+    #[test]
+    fn anon_flat_empty_inventory_roundtrip() {
+        let inv = Inventory::new();
+        let grid = inventory_to_flat_grid(&inv);
+        // Exactly one row (META), padded to FLAT_WIDTH.
+        assert_eq!(grid.len(), 1);
+        assert_eq!(grid[0][0], REC_META);
+        assert_eq!(grid[0].len(), FLAT_WIDTH);
+        let back = flat_grid_to_inventory(&grid).unwrap();
+        assert_eq!(inv, back);
+        assert_eq!(back.next_id, 1);
+    }
+
+    #[test]
+    fn anon_flat_grid_through_gviz_csv_roundtrip() {
+        // Prove the read path (gviz CSV) and write path (flat grid) agree: encode
+        // -> CSV -> parse_csv -> flat_grid_to_inventory reconstructs losslessly.
+        let inv = rich_inventory();
+        let grid = inventory_to_flat_grid(&inv);
+        let csv = flat_grid_to_gviz_csv(&grid);
+        let parsed = parse_csv(&csv);
+        let back = flat_grid_to_inventory(&parsed).unwrap();
+        assert_eq!(inv, back, "flat layout survives a gviz CSV round-trip");
+    }
+
+    #[test]
+    fn anon_inner_set_cell_matches_captured_shape() {
+        // Captured verbatim: A1="claudeprobe777" on gid "0".
+        let inner = anon_inner_set_cell("0", 0, 0, "claudeprobe777");
+        assert_eq!(
+            inner,
+            "[[\"0\",0,1,0,1],[132274236,3,[2,\"claudeprobe777\"],null,null,0],\
+             [null,[[null,513,[0],null,null,null,null,null,null,null,null,0]]]]"
+        );
+    }
+
+    #[test]
+    fn anon_build_bundles_shape() {
+        let cells = vec![(1, 1, "v".to_string())];
+        let bundles = anon_build_bundles("mysid", 0, &cells);
+        let v: Value = serde_json::from_str(&bundles).unwrap();
+        assert_eq!(v[0]["sid"], "mysid");
+        assert_eq!(v[0]["reqId"], 0);
+        // commands[0] = [OP_BUNDLE, "<inner string>"]
+        assert_eq!(v[0]["commands"][0][0], OP_BUNDLE);
+        let inner = v[0]["commands"][0][1].as_str().unwrap();
+        assert_eq!(inner, anon_inner_set_cell(ANON_GID, 1, 1, "v"));
+    }
+
+    #[test]
+    fn anon_build_bundles_multiple_cells() {
+        let cells = vec![(0, 0, "a".into()), (0, 1, "b".into()), (2, 3, "c".into())];
+        let bundles = anon_build_bundles("s", 4, &cells);
+        let v: Value = serde_json::from_str(&bundles).unwrap();
+        assert_eq!(v[0]["reqId"], 4);
+        assert_eq!(v[0]["commands"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn anon_parse_revision_and_sid_from_html() {
+        let html = "junk...\"revision\":42,\"sid\":\"abc123def456\",\"oui\":\"ANONYMOUS_9\"...end";
+        assert_eq!(parse_html_revision(html), Some(42));
+        assert_eq!(parse_html_sid(html).as_deref(), Some("abc123def456"));
+        // Missing fields -> None.
+        assert_eq!(parse_html_revision("nothing here"), None);
+        assert_eq!(parse_html_sid("nothing here"), None);
+    }
+
+    #[test]
+    fn anon_parse_save_response_success_and_error() {
+        let ok = ")]}'\n{\"revisionRanges\":[[7,7]],\"metadata\":{\"serverRevision\":6}}";
+        assert_eq!(parse_save_response(ok).unwrap(), 7);
+        // Multi-command save: take the max hi.
+        let multi = ")]}'\n{\"revisionRanges\":[[10,11],[12,14]]}";
+        assert_eq!(parse_save_response(multi).unwrap(), 14);
+        // Channel error response surfaces as a Backend error.
+        let err = ")]}'\n\n[[\"er\",null,null,null,null,550,null,null,null,13],[\"di\",37]]";
+        assert!(parse_save_response(err).is_err());
+        // No revisionRanges is also an error.
+        let nope = ")]}'\n{\"metadata\":{}}";
+        assert!(parse_save_response(nope).is_err());
+    }
+
+    #[test]
+    fn anon_multipart_encodes_fields() {
+        let (ct, body) = anon_multipart(&[("rev", "6"), ("bundles", "[{}]")]);
+        assert!(ct.starts_with("multipart/form-data; boundary="));
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("name=\"rev\"\r\n\r\n6\r\n"));
+        assert!(text.contains("name=\"bundles\"\r\n\r\n[{}]\r\n"));
+        assert!(text.trim_end().ends_with("--"));
     }
 
     // --- full grid roundtrip ------------------------------------------------
@@ -1743,6 +2314,19 @@ mod tests {
             // spreadsheets.create
             Ok(serde_json::json!({ "spreadsheetId": "CREATED" }))
         }
+
+        // The OAuth/AppHosted fake never exercises the anonymous browser path.
+        fn get_browser(&self, _url: &str) -> Result<String, StoreError> {
+            Err(StoreError::Backend("fake: get_browser unused".into()))
+        }
+        fn post_multipart(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            _body: &[u8],
+        ) -> Result<String, StoreError> {
+            Err(StoreError::Backend("fake: post_multipart unused".into()))
+        }
     }
 
     /// Minimal percent-decoder for the fake transport's range extraction.
@@ -1772,6 +2356,125 @@ mod tests {
             },
             Box::new(fake),
         )
+    }
+
+    // --- fake transport for the anonymous (PublicUrl) flat-layout path -------
+
+    /// A fake link-shared sheet held in memory as a flat [`Grid`]. It serves:
+    /// * `get_text`      (gviz CSV) -> the flat grid serialized to CSV;
+    /// * `get_browser`   (`/edit`)  -> minimal HTML carrying `"revision":N` and a
+    ///   server `"sid"`;
+    /// * `post_multipart`(`/save`)  -> parses the `bundles` field, applies each
+    ///   set-cell command to the grid, bumps the revision, returns a `/save`-shaped
+    ///   response. This drives the whole anonymous transact loop without a network.
+    struct FakeAnonSheet {
+        grid: Mutex<Grid>,
+        revision: Mutex<i64>,
+        sid: String,
+    }
+
+    impl FakeAnonSheet {
+        fn new(inv: Inventory) -> Arc<Self> {
+            Arc::new(FakeAnonSheet {
+                grid: Mutex::new(inventory_to_flat_grid(&inv)),
+                revision: Mutex::new(6),
+                sid: "0123456789abcdef".to_string(),
+            })
+        }
+        fn revision(&self) -> i64 {
+            *self.revision.lock().unwrap()
+        }
+    }
+
+    /// Serialize a grid to gviz-style CSV (quoting every cell, like gviz does),
+    /// trimming trailing fully-empty rows the way gviz output does.
+    fn flat_grid_to_gviz_csv(grid: &Grid) -> String {
+        // Drop trailing all-empty rows.
+        let last = grid
+            .iter()
+            .rposition(|r| r.iter().any(|c| !c.is_empty()))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out = String::new();
+        for row in &grid[..last] {
+            // Trim trailing empty cells per row (gviz does this too).
+            let last_col = row
+                .iter()
+                .rposition(|c| !c.is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let cells: Vec<String> = row[..last_col]
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect();
+            out.push_str(&cells.join(","));
+            out.push('\n');
+        }
+        out
+    }
+
+    impl Transport for Arc<FakeAnonSheet> {
+        fn get_text(&self, _url: &str) -> Result<String, StoreError> {
+            Ok(flat_grid_to_gviz_csv(&self.grid.lock().unwrap()))
+        }
+        fn get_json(&self, _u: &str, _t: &str) -> Result<Value, StoreError> {
+            unreachable!("anon path never calls get_json")
+        }
+        fn post_json(&self, _u: &str, _t: &str, _b: &Value) -> Result<Value, StoreError> {
+            unreachable!("anon path never calls post_json")
+        }
+        fn get_browser(&self, _url: &str) -> Result<String, StoreError> {
+            let rev = *self.revision.lock().unwrap();
+            Ok(format!(
+                "<html>...\"revision\":{rev},\"sid\":\"{}\",\"oui\":\"ANONYMOUS_1\"...</html>",
+                self.sid
+            ))
+        }
+        fn post_multipart(
+            &self,
+            _url: &str,
+            _content_type: &str,
+            body: &[u8],
+        ) -> Result<String, StoreError> {
+            let body = String::from_utf8_lossy(body);
+            // Extract the `bundles` multipart field value (between its blank line
+            // and the trailing CRLF before the next boundary).
+            let marker = "name=\"bundles\"\r\n\r\n";
+            let start = body.find(marker).expect("bundles field present") + marker.len();
+            let rest = &body[start..];
+            let end = rest.find("\r\n--").unwrap_or(rest.len());
+            let bundles_json = &rest[..end];
+
+            let bundles: Value = serde_json::from_str(bundles_json).expect("bundles JSON");
+            let mut grid = self.grid.lock().unwrap();
+            for bundle in bundles.as_array().unwrap() {
+                for cmd in bundle["commands"].as_array().unwrap() {
+                    // cmd = [OP_BUNDLE, "<inner JSON string>"]
+                    let inner_str = cmd[1].as_str().unwrap();
+                    let inner: Value = serde_json::from_str(inner_str).unwrap();
+                    // inner[0] = [gid, row, row+1, col, col+1]
+                    let coords = inner[0].as_array().unwrap();
+                    let row = coords[1].as_i64().unwrap() as usize;
+                    let c = coords[3].as_i64().unwrap() as usize;
+                    // inner[1] = [OP_SET_CELL, 3, [2, "<v>"], ...]
+                    let v = inner[1][2][1].as_str().unwrap().to_string();
+                    while grid.len() <= row {
+                        grid.push(Vec::new());
+                    }
+                    while grid[row].len() <= c {
+                        grid[row].push(String::new());
+                    }
+                    grid[row][c] = v;
+                }
+            }
+            let mut rev = self.revision.lock().unwrap();
+            *rev += 1;
+            let new = *rev;
+            Ok(format!(
+                ")]}}'\n{{\"revisionRanges\":[[{new},{new}]],\"metadata\":{{\"serverRevision\":{}}}}}",
+                new - 1
+            ))
+        }
     }
 
     #[test]
@@ -1843,6 +2546,12 @@ mod tests {
             fn post_json(&self, _u: &str, _t: &str, _b: &Value) -> Result<Value, StoreError> {
                 panic!("must never commit under sustained contention");
             }
+            fn get_browser(&self, _u: &str) -> Result<String, StoreError> {
+                unreachable!()
+            }
+            fn post_multipart(&self, _u: &str, _c: &str, _b: &[u8]) -> Result<String, StoreError> {
+                unreachable!()
+            }
         }
         let t = Arc::new(AlwaysMoving { tick: Mutex::new(0) });
         let store = GSheetStore::with_transport(
@@ -1871,23 +2580,57 @@ mod tests {
     // --- access-mode / credential branch behavior --------------------------
 
     #[test]
-    fn public_url_is_read_only() {
-        // Constructs from a URL with no credential; writes are rejected.
+    fn public_url_read_write_roundtrip_via_fake_anon_transport() {
+        // PublicUrl is now READ-WRITE: the anonymous flat-layout transact reads
+        // the gviz CSV, applies the closure, and writes back via the /edit+/save
+        // protocol. A fake transport models the sheet as a flat grid in memory.
+        let fake = FakeAnonSheet::new(Inventory::new());
         let store = GSheetStore::with_transport(
             Access::PublicUrl {
-                url: "https://docs.google.com/spreadsheets/d/sid/edit".into(),
+                url: "https://docs.google.com/spreadsheets/d/SID/edit".into(),
             },
-            // transport unused on the write rejection path
-            Box::new(FakeSheet::new(BTreeMap::new())),
+            Box::new(fake.clone()),
         );
-        let res = store.transact(&mut |inv| {
-            inv.add_instance("Item", "x", BTreeMap::new(), None, 1)
-                .map_err(|e| StoreError::Backend(e.to_string()))
-        });
-        match res {
-            Err(StoreError::Backend(m)) => assert!(m.contains("read-only"), "{m}"),
-            other => panic!("expected read-only Backend error, got {other:?}"),
-        }
+
+        // A fresh sheet loads as empty.
+        assert!(store.load().unwrap().instances.is_empty());
+
+        // Write through transact.
+        let id = store
+            .transact(&mut |inv| {
+                inv.add_instance("Item", "thing", BTreeMap::new(), None, 1)
+                    .map_err(|e| StoreError::Backend(e.to_string()))
+            })
+            .expect("anonymous transact should commit");
+        assert_eq!(id, 1);
+
+        // Read it back through the same store.
+        let back = store.load().expect("reload");
+        assert_eq!(back.get(1).unwrap().name, "thing");
+        // The revision advanced on the underlying fake.
+        assert!(fake.revision() > 6);
+    }
+
+    #[test]
+    fn public_anon_lossless_roundtrip_rich_inventory() {
+        // The full rich inventory round-trips through the flat-layout anon path.
+        let fake = FakeAnonSheet::new(Inventory::new());
+        let store = GSheetStore::with_transport(
+            Access::PublicUrl {
+                url: "https://docs.google.com/spreadsheets/d/SID/edit".into(),
+            },
+            Box::new(fake.clone()),
+        );
+        let inv = rich_inventory();
+        let target = inv.clone();
+        store
+            .transact(&mut |cur| {
+                *cur = target.clone();
+                Ok(())
+            })
+            .expect("write rich inventory");
+        let back = store.load().expect("reload rich inventory");
+        assert_eq!(back, inv, "anon flat-layout round-trip is lossless");
     }
 
     #[test]
@@ -1922,13 +2665,13 @@ mod tests {
     }
 
     #[test]
-    fn public_blank_sheet_gives_actionable_error() {
-        // A brand-new blank public sheet has none of our native tabs, so gviz
-        // returns no usable `_meta` `version`. Rather than a cryptic parse error,
-        // the load surfaces an actionable message pointing at OAuth mode.
+    fn public_blank_sheet_reads_as_empty_inventory() {
+        // A brand-new blank link-shared sheet (gviz returns an empty document) now
+        // reads back as an empty inventory — not an error — because the flat layout
+        // tolerates a never-written `Sheet1` and the anon path can initialize it on
+        // first write.
 
-        /// A fake transport whose every gviz CSV read returns an empty document,
-        /// modeling a blank sheet that lacks our native tabs.
+        /// A fake transport whose gviz CSV read returns an empty document.
         struct BlankPublic;
         impl Transport for BlankPublic {
             fn get_text(&self, _url: &str) -> Result<String, StoreError> {
@@ -1945,6 +2688,17 @@ mod tests {
             ) -> Result<Value, StoreError> {
                 unreachable!("public path never calls post_json")
             }
+            fn get_browser(&self, _url: &str) -> Result<String, StoreError> {
+                unreachable!("load() never calls get_browser")
+            }
+            fn post_multipart(
+                &self,
+                _url: &str,
+                _content_type: &str,
+                _body: &[u8],
+            ) -> Result<String, StoreError> {
+                unreachable!("load() never calls post_multipart")
+            }
         }
 
         let store = GSheetStore::with_transport(
@@ -1953,15 +2707,10 @@ mod tests {
             },
             Box::new(BlankPublic),
         );
-        match store.load() {
-            Err(StoreError::Backend(m)) => {
-                assert!(
-                    m.contains("no inventory data yet") && m.contains("OAuth"),
-                    "{m}"
-                );
-            }
-            other => panic!("expected an actionable Backend error, got {other:?}"),
-        }
+        let inv = store.load().expect("blank sheet loads as empty inventory");
+        assert!(inv.instances.is_empty());
+        assert!(inv.classes.is_empty());
+        assert_eq!(inv.next_id, 1);
     }
 
     #[test]

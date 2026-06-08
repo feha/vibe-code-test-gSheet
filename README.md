@@ -8,7 +8,7 @@ database *you* own — and that store *is* the identity. Three backends:
 
 1. **Local JSON file** — a human-editable document on the server's filesystem. ✅ working
 2. **Postgres** — your own PostgreSQL instance, stored in **real relational tables + views**. ✅ working (live-verified)
-3. **Google Sheet** — "Excel as a database", stored as **one tab per class** (rows = items, columns = fields). 🟡 public-link read works with zero setup; OAuth read-write needs a one-time Google OAuth client
+3. **Google Sheet** — "Excel as a database". **Public link = anonymous read-write** (no sign-in — replicates the web editor's private `/save` protocol; flat single-sheet layout; verified live). **OAuth** = read-write with per-class tabs (needs a one-time Google client). ✅
 
 **Multi-user = multiple app instances on the same store with no race conditions.**
 Every mutation goes through `Store::transact` (load → apply → atomic commit → retry on

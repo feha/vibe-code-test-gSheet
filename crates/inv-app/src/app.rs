@@ -164,16 +164,16 @@ fn OpenDatabase() -> impl IntoView {
                     <p class="muted">"Use a Google Sheet as the backing store. Pick how to connect."</p>
 
                     <div class="gs-mode">
-                        <h3 class="gs-mode-title">"Public link (read-only)"</h3>
-                        <p class="muted">"Read a published or link-shared sheet. No sign-in. Changes cannot be saved."</p>
+                        <h3 class="gs-mode-title">"Public link (anonymous read-write)"</h3>
+                        <p class="muted">"An \"anyone with the link can edit\" sheet. No sign-in — the app reads and writes it anonymously, the same way the browser editor does (best-effort)."</p>
                         <input
                             class="text-input"
                             r#type="text"
-                            placeholder="https://docs.google.com/.../export?format=csv"
+                            placeholder="https://docs.google.com/spreadsheets/d/<id>/edit"
                             prop:value=move || gs_public_url.get()
                             on:input=move |ev| gs_public_url.set(event_value(&ev))
                         />
-                        <button class="btn btn-primary" on:click=open_gs_public>"Open read-only"</button>
+                        <button class="btn btn-primary" on:click=open_gs_public>"Open"</button>
                     </div>
 
                     <div class="gs-mode">
